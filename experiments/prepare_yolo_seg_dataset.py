@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Prepare YOLO segmentation dataset from Severstal PNG bitmap annotations
+Prepare YOLO segmentation dataset from Severstal PNG bitmap annotations - CORRECTED VERSION
 Converts PNG bitmap compressed in JSON to YOLO segmentation format
+
+CORRECTED: Now properly uses the 'origin' field from Supervisely bitmap format
+- Fixes critical bug where bitmaps were positioned incorrectly  
+- Uses cv2 for PNG decoding (same as working detection scripts)
+- Properly positions bitmap fragments within the full image using origin coordinates
 """
 
 import os
@@ -56,24 +61,26 @@ def check_dependencies():
     return True
 
 def decode_png_bitmap(annotation_data, img_width, img_height):
-    """Decode PNG bitmap from Severstal annotation with proper positioning"""
+    """Decode PNG bitmap from Severstal annotation with proper positioning - CORRECTED VERSION"""
     try:
-        # Decode base64
-        png_data = base64.b64decode(annotation_data)
-        # Decompress PNG
-        png_decompressed = zlib.decompress(png_data)
-        # Convert to PIL Image
-        mask_img = Image.open(BytesIO(png_decompressed))
+        # Decode bitmap from base64 and zlib (same as corrected detection script)
+        decoded_data = base64.b64decode(annotation_data)
+        decompressed_data = zlib.decompress(decoded_data)
         
-        # Convert to RGBA if not already
-        if mask_img.mode != 'RGBA':
-            mask_img = mask_img.convert('RGBA')
+        # Use cv2 to decode PNG (same as working scripts)
+        nparr = np.frombuffer(decompressed_data, np.uint8)
+        bitmap_img = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
         
-        # Extract alpha channel (transparency) - this is the actual mask
-        alpha_channel = np.array(mask_img.split()[-1])  # Last channel is alpha
+        if bitmap_img is None:
+            print("    Warning: Failed to decode bitmap with cv2")
+            return None
         
-        # Binarize: alpha > 0 means the pixel is part of the mask
-        binary_mask = (alpha_channel > 0).astype(np.uint8)
+        # Handle different image formats
+        if len(bitmap_img.shape) == 3:
+            bitmap_img = bitmap_img[:, :, 0]  # Take first channel
+        
+        # Ensure binary mask
+        binary_mask = (bitmap_img > 0).astype(np.uint8)
         
         return binary_mask
         

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Evaluate YOLO+SAM2 pipeline on Severstal test split
-Test data: datasets/Data/splits/test_split (2000 images)
+Test data: datasets/yolo_detection_fixed (full dataset)
+       or: datasets/yolo_detection_fixed/subset_XXX (subset)
 
 Pipeline: YOLO bboxes → SAM2 box-prompts → mask merging → evaluation
 
@@ -16,6 +17,7 @@ Requirements:
 - Mask threshold: report fixed 0.5 and optimal-val (pre-calculated)
 - If SAM2 returns multiple masks per bbox, keep highest score
 - Use best SAM2 fine-tuned model (small or large) based on val mIoU
+- Supports both full dataset and subset evaluation
 """
 
 import os
@@ -43,9 +45,12 @@ from sklearn.metrics import average_precision_score, precision_recall_curve
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # Import SAM2 utilities
-from segment_anything import sam_model_registry, SamPredictor
+import sys
+sys.path.append('libs/sam2base')
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 from utils.metrics import SegmentationMetrics
-from utils.postproc import apply_morphology, fill_holes
+import cv2
 
 
 def set_seed(seed):
@@ -57,26 +62,67 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def load_sam2_model(checkpoint_path, model_type="vit_h"):
+def cleanup_memory():
+    """Clean up GPU and CPU memory"""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def save_incremental_results(all_metrics, image_names, output_dir, batch_num):
+    """Save incremental results to avoid data loss"""
+    if not all_metrics:
+        return
+    
+    # Create incremental results directory
+    incremental_dir = os.path.join(output_dir, "incremental")
+    os.makedirs(incremental_dir, exist_ok=True)
+    
+    # Calculate current average metrics
+    avg_metrics = {}
+    for key in all_metrics[0].keys():
+        avg_metrics[key] = np.mean([m[key] for m in all_metrics])
+    
+    # Save incremental summary
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M")
+    summary_file = os.path.join(incremental_dir, f"batch_{batch_num:03d}_{timestamp}_summary.json")
+    
+    summary_data = {
+        'batch_number': batch_num,
+        'total_images_processed': len(all_metrics),
+        'timestamp': timestamp,
+        'avg_metrics': {k: float(v) for k, v in avg_metrics.items()}
+    }
+    
+    with open(summary_file, 'w') as f:
+        json.dump(summary_data, f, indent=2)
+    
+    print(f"    Incremental results saved: {summary_file}")
+
+
+def load_sam2_model(checkpoint_path, model_type="sam2_hiera_l"):
     """Load SAM2 fine-tuned model"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"Loading SAM2 model from: {checkpoint_path}")
     print(f"Model type: {model_type}")
     
-    sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
-    sam.to(device=device)
+    # Use the correct config file path
+    config_file = f"configs/sam2/{model_type}.yaml"
     
-    predictor = SamPredictor(sam)
+    sam2 = build_sam2(config_file=config_file, ckpt_path=checkpoint_path, device=device)
+    predictor = SAM2ImagePredictor(sam2)
     
-    return sam, predictor, device
+    return sam2, predictor, device
 
 
 def load_yolo_predictions(labels_dir):
     """Load YOLO bounding box predictions from labels directory"""
     predictions = {}
     
-    # YOLO format: class x_center y_center width height (normalized 0-1)
+    # YOLO format: class x_center y_center width height [confidence] (normalized 0-1)
     for label_file in Path(labels_dir).glob("*.txt"):
         image_name = label_file.stem + ".jpg"  # Assuming .jpg extension
         
@@ -92,15 +138,15 @@ def load_yolo_predictions(labels_dir):
                 y_center = float(parts[2])
                 width = float(parts[3])
                 height = float(parts[4])
+                confidence = float(parts[5]) if len(parts) >= 6 else 1.0
                 
-                # Convert normalized coordinates to pixel coordinates
-                # Note: Will be converted back to normalized for SAM2
                 bboxes.append({
                     'class_id': class_id,
                     'x_center': x_center,
                     'y_center': y_center,
                     'width': width,
-                    'height': height
+                    'height': height,
+                    'conf': confidence
                 })
         
         predictions[image_name] = bboxes
@@ -109,33 +155,103 @@ def load_yolo_predictions(labels_dir):
     return predictions
 
 
-def load_ground_truth_annotations(annotations_file):
-    """Load ground truth annotations from JSON file"""
-    with open(annotations_file, 'r') as f:
-        data = json.load(f)
+def load_ground_truth_annotations(ann_dir):
+    """Load ground truth annotations from Supervisely format JSON files with proper origin positioning"""
+    gt = {}
+    for jf in Path(ann_dir).glob("*.jpg.json"):
+        try:
+            data = json.load(open(jf))
+            objs = []
+            for o in data.get("objects", []):
+                bmp = o.get("bitmap", {})
+                if "data" not in bmp or "origin" not in bmp:
+                    continue
+                raw = zlib.decompress(base64.b64decode(bmp["data"]))
+                patch = np.array(Image.open(BytesIO(raw)))
+                if patch.ndim == 3 and patch.shape[2] == 4:
+                    patch = patch[:, :, 3]  # Alpha channel
+                elif patch.ndim == 3:
+                    patch = patch[:, :, 0]  # First channel
+                patch = (patch > 0).astype(np.uint8)
+                ox, oy = map(int, bmp["origin"])  # origin = [x, y]
+                objs.append((patch, (ox, oy)))
+            # Extract image name from filename (remove .jpg.json extension)
+            image_name = jf.stem.replace('.jpg', '') + ".jpg"
+            gt[image_name] = objs  # guarda parches+origen
+        except Exception as e:
+            print(f"Warning: Could not load {jf}: {e}")
+            # Extract image name from filename (remove .jpg.json extension)
+            image_name = jf.stem.replace('.jpg', '') + ".jpg"
+            gt[image_name] = []
+            continue
     
-    gt_annotations = {}
-    
-    for item in data:
-        image_name = item['filename']
-        
-        if 'annotations' in item:
-            masks = []
-            for ann in item['annotations']:
-                if 'bitmap' in ann:
-                    # Decode PNG bitmap from base64
-                    bitmap_data = base64.b64decode(ann['bitmap']['data'])
-                    mask = np.array(Image.open(BytesIO(bitmap_data)))
-                    masks.append(mask)
-            
-            gt_annotations[image_name] = masks
-    
-    print(f"Loaded ground truth for {len(gt_annotations)} images")
-    return gt_annotations
+    print(f"Loaded ground truth (objects) for {len(gt)} images")
+    return gt
 
+
+# --- utils for YOLO->SAM2 box preprocessing ---
+def box_iou_xyxy(a, b):
+    """Calculate IoU between two boxes in [x1,y1,x2,y2] format"""
+    x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+    inter = max(0, x2-x1+1) * max(0, y2-y1+1)
+    area_a = (a[2]-a[0]+1)*(a[3]-a[1]+1)
+    area_b = (b[2]-b[0]+1)*(b[3]-b[1]+1)
+    union = area_a + area_b - inter
+    return inter/union if union>0 else 0.0
+
+def widen_slender(box, W, H, min_w_px=8, pad_px=6):
+    """Ensancha cajas muy estrechas para dar contexto a SAM2"""
+    x1,y1,x2,y2 = map(int, box)
+    if (x2-x1+1) < min_w_px:
+        cx = (x1+x2)//2
+        x1 = max(0, cx - (min_w_px//2) - pad_px)
+        x2 = min(W-1, cx + (min_w_px//2) + pad_px)
+    return [x1,y1,x2,y2]
+
+def preprocess_yolo_boxes_for_sam2(yolo_boxes, W, H, iou_merge=0.85, topk=20,
+                                   min_w_px=8, pad_px=6):
+    """
+    yolo_boxes: list of dicts {cx,cy,w,h,conf} (normalizados)
+    Return: list of xyxy pixel boxes (tras merge y ensanchado), ordenados por conf
+    """
+    # 1) norm->px
+    boxes = []
+    for b in yolo_boxes:
+        cx, cy, w, h = b["x_center"]*W, b["y_center"]*H, b["width"]*W, b["height"]*H
+        x1 = max(0, int(round(cx - w/2))); y1 = max(0, int(round(cy - h/2)))
+        x2 = min(W-1, int(round(cx + w/2))); y2 = min(H-1, int(round(cy + h/2)))
+        if x2 <= x1 or y2 <= y1: 
+            continue
+        boxes.append({"xyxy":[x1,y1,x2,y2], "conf": b.get("conf",1.0)})
+
+    # 2) merge de duplicados (IoU alto)
+    boxes = sorted(boxes, key=lambda x: x["conf"], reverse=True)
+    kept = []
+    for b in boxes:
+        merged = False
+        for k in kept:
+            if box_iou_xyxy(b["xyxy"], k["xyxy"]) >= iou_merge:
+                # unir por envolvente
+                x1 = min(b["xyxy"][0], k["xyxy"][0])
+                y1 = min(b["xyxy"][1], k["xyxy"][1])
+                x2 = max(b["xyxy"][2], k["xyxy"][2])
+                y2 = max(b["xyxy"][3], k["xyxy"][3])
+                k["xyxy"] = [x1,y1,x2,y2]
+                k["conf"] = max(k["conf"], b["conf"])
+                merged = True
+                break
+        if not merged:
+            kept.append(b)
+
+    # 3) ensanchar ultraestrechas
+    out = []
+    for k in kept[:topk]:
+        out.append(widen_slender(k["xyxy"], W, H, min_w_px=min_w_px, pad_px=pad_px))
+    return out
 
 def convert_bbox_to_sam2_format(bbox, img_width, img_height):
-    """Convert YOLO bbox to SAM2 input format"""
+    """Convert YOLO bbox to SAM2 input format (legacy function, use preprocess_yolo_boxes_for_sam2 instead)"""
     # YOLO format: normalized x_center, y_center, width, height
     x_center = bbox['x_center'] * img_width
     y_center = bbox['y_center'] * img_height
@@ -164,6 +280,7 @@ def generate_sam2_masks(predictor, image, bboxes, threshold=0.5):
     
     masks = []
     scores = []
+    probs = []
     
     for bbox in bboxes:
         # Convert bbox to SAM2 format
@@ -179,49 +296,80 @@ def generate_sam2_masks(predictor, image, bboxes, threshold=0.5):
         best_idx = np.argmax(scores_pred)
         best_mask = masks_pred[best_idx]
         best_score = scores_pred[best_idx]
+        best_logits = logits_pred[best_idx] if logits_pred is not None else None
         
-        # Apply threshold
-        binary_mask = best_mask > threshold
+        # Get probability map from logits
+        if best_logits is not None:
+            # Convert logits to probabilities using sigmoid
+            prob = torch.sigmoid(torch.from_numpy(best_logits)).numpy()
+            # Resize to image dimensions if needed
+            if prob.shape != image.shape[:2]:
+                prob = cv2.resize(prob, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
+        else:
+            # Fallback to binary mask as probability
+            prob = best_mask.astype(np.float32)
         
-        masks.append(binary_mask)
+        masks.append(best_mask)
         scores.append(best_score)
+        probs.append(prob)
     
-    return masks, scores
+    return masks, scores, probs
 
 
-def merge_masks_per_image(masks, scores, img_height, img_width):
-    """Merge multiple masks per image, keeping highest score per pixel"""
+def merge_masks_per_image(masks, scores, probs, img_height, img_width):
+    """Merge multiple masks per image, keeping highest probability per pixel"""
     if not masks:
-        return np.zeros((img_height, img_width), dtype=np.uint8)
+        return np.zeros((img_height, img_width), dtype=np.uint8), np.zeros((img_height, img_width), dtype=np.float32)
     
-    # Create merged mask
-    merged_mask = np.zeros((img_height, img_width), dtype=np.uint8)
-    score_map = np.zeros((img_height, img_width), dtype=np.float32)
+    # Create merged probability map (max probability per pixel)
+    merged_prob = np.zeros((img_height, img_width), dtype=np.float32)
     
-    for mask, score in zip(masks, scores):
-        # Update merged mask where this mask has higher score
-        update_mask = score > score_map
-        merged_mask[update_mask] = mask[update_mask]
-        score_map[update_mask] = score
+    for prob in probs:
+        # Ensure prob has correct dimensions
+        if prob.shape != (img_height, img_width):
+            prob = cv2.resize(prob, (img_width, img_height), interpolation=cv2.INTER_LINEAR)
+        # Take maximum probability per pixel
+        merged_prob = np.maximum(merged_prob, prob)
     
-    return merged_mask
+    # Create binary mask from probability threshold
+    merged_mask = (merged_prob > 0.5).astype(np.uint8)  # Default threshold, will be optimized later
+    
+    return merged_mask, merged_prob
+
+
+def build_gt_union(gt_objs, H, W):
+    """Build ground truth union mask from patches with proper origin positioning"""
+    union = np.zeros((H, W), np.uint8)
+    for patch, (ox, oy) in gt_objs:
+        ph, pw = patch.shape
+        x1, y1 = max(0, ox), max(0, oy)
+        x2, y2 = min(W, ox + pw), min(H, oy + ph)
+        if x2 > x1 and y2 > y1:
+            union[y1:y2, x1:x2] = np.maximum(
+                union[y1:y2, x1:x2], patch[:(y2 - y1), :(x2 - x1)]
+            )
+    return union
 
 
 def apply_post_processing(mask, fill_holes_flag=True, morphology_flag=True):
-    """Apply post-processing to mask"""
+    """Apply post-processing to mask using OpenCV"""
     if fill_holes_flag:
-        mask = fill_holes(mask)
+        # Fill holes using morphological operations
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     
     if morphology_flag:
-        mask = apply_morphology(mask, operation='open', kernel_size=3)
-        mask = apply_morphology(mask, operation='close', kernel_size=3)
+        # Apply opening (remove noise) and closing (fill gaps)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     
     return mask
 
 
 def evaluate_masks(pred_masks, gt_masks, metrics_calculator, threshold=0.5):
     """Evaluate predicted masks against ground truth"""
-    if not pred_masks or not gt_masks:
+    if pred_masks is None or gt_masks is None:
         return None
     
     # Convert predictions to binary if needed
@@ -229,12 +377,17 @@ def evaluate_masks(pred_masks, gt_masks, metrics_calculator, threshold=0.5):
         pred_masks = (pred_masks > threshold).astype(np.uint8)
     
     # Calculate metrics
-    metrics = metrics_calculator.compute_pixel_metrics(
-        pred_masks.flatten(),
-        gt_masks.flatten()
-    )
-    
-    return metrics
+    try:
+        metrics = metrics_calculator.compute_pixel_metrics(
+            pred_masks.flatten(),
+            gt_masks.flatten()
+        )
+        return metrics
+    except Exception as e:
+        print(f"Error calculating metrics: {e}")
+        print(f"pred_masks shape: {pred_masks.shape}, dtype: {pred_masks.dtype}")
+        print(f"gt_masks shape: {gt_masks.shape}, dtype: {gt_masks.dtype}")
+        return None
 
 
 def find_optimal_threshold(predictions, targets, metric='f1'):
@@ -305,12 +458,23 @@ def calculate_iou_at_threshold(predictions, targets, threshold):
 def save_evaluation_results(exp_id, model, subset_size, variant, prompt_type, img_size, 
                            conf_threshold, iou_threshold, max_detections, 
                            test_metrics_fixed, test_metrics_opt, opt_threshold,
-                           predictions_dir, save_dir, timestamp):
+                           predictions_dir, save_dir, timestamp, all_predictions, all_targets, all_metrics, image_names,
+                           all_inference_times=None, fill_holes=False, morphology=False, iou_merge=0.85, topk_boxes=20, min_w_px=8, pad_px=6):
     """Save evaluation results to CSV following TFM format"""
     
     # Create results directory
     results_dir = os.path.join(save_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
+    
+    # Calculate inference time statistics
+    if all_inference_times and len(all_inference_times) > 0:
+        mean_inference_time = np.mean(all_inference_times)
+        std_inference_time = np.std(all_inference_times)
+        total_inference_time = np.sum(all_inference_times)
+    else:
+        mean_inference_time = 0.0
+        std_inference_time = 0.0
+        total_inference_time = 0.0
     
     # Prepare results data
     results_data = {
@@ -327,21 +491,32 @@ def save_evaluation_results(exp_id, model, subset_size, variant, prompt_type, im
         'seed': 42,  # Fixed for evaluation
         'val_mIoU': 0.0,  # Not applicable for test evaluation
         'val_Dice': 0.0,  # Not applicable for test evaluation
-        'test_mIoU': test_metrics_opt.get('mean_iou', 0.0),
-        'test_Dice': test_metrics_opt.get('mean_dice', 0.0),
+        'test_mIoU': test_metrics_opt.get('iou', 0.0),
+        'test_Dice': test_metrics_opt.get('dice', 0.0),
         'IoU@50': test_metrics_opt.get('iou_50', 0.0),
         'IoU@75': test_metrics_opt.get('iou_75', 0.0),
         'IoU@90': test_metrics_opt.get('iou_90', 0.0),
-        'IoU@95': 0.0,  # Not calculated
+        'IoU@95': test_metrics_opt.get('iou_95', 0.0),
         'Precision': test_metrics_opt.get('precision', 0.0),
         'Recall': test_metrics_opt.get('recall', 0.0),
         'F1': test_metrics_opt.get('f1', 0.0),
+        'AUPRC': test_metrics_opt.get('auprc', 0.0),
+        'mean_inference_time': mean_inference_time,
+        'std_inference_time': std_inference_time,
+        'total_inference_time': total_inference_time,
+        'num_samples': len(all_metrics) if all_metrics else 0,
         'ckpt_path': predictions_dir,
         'timestamp': timestamp,
         'conf_threshold': conf_threshold,
         'iou_threshold': iou_threshold,
         'max_detections': max_detections,
-        'opt_threshold': opt_threshold
+        'opt_threshold': opt_threshold,
+        'postproc_fill_holes': fill_holes,
+        'postproc_morphology': morphology,
+        'preproc_iou_merge': iou_merge,
+        'preproc_topk_boxes': topk_boxes,
+        'preproc_min_w_px': min_w_px,
+        'preproc_pad_px': pad_px
     }
     
     # Save to CSV
@@ -355,41 +530,222 @@ def save_evaluation_results(exp_id, model, subset_size, variant, prompt_type, im
         writer.writerow(results_data)
     
     print(f"Evaluation results saved to: {csv_path}")
+    
+    # Save per-image results CSV
+    per_image_csv = save_per_image_results(
+        exp_id, "yolo_sam2", "pipeline", all_predictions, all_targets, 
+        all_metrics, image_names, results_dir, timestamp
+    )
+    
     return csv_path
+
+
+def process_batch(batch_images, predictor, yolo_predictions, gt_annotations, 
+                 args, metrics_calculator, masks_output_dir=None):
+    """Process a batch of images and return results"""
+    import time
+    batch_predictions = []
+    batch_targets = []
+    batch_metrics = []
+    batch_image_names = []
+    batch_inference_times = []
+    
+    for image_name in batch_images:
+        start_time = time.time()
+        # Load image
+        image_path = os.path.join(args.test_images_dir, image_name)
+        if not os.path.exists(image_path):
+            print(f"Warning: Image not found: {image_path}")
+            continue
+        
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"Warning: Could not load image: {image_path}")
+            continue
+        
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img_height, img_width = image.shape[:2]
+        
+        # Get YOLO bboxes for this image
+        bboxes = yolo_predictions[image_name]
+        
+        if not bboxes:
+            # No bboxes detected - create zero mask and evaluate
+            merged_mask = np.zeros((img_height, img_width), dtype=np.uint8)
+            merged_prob = np.zeros((img_height, img_width), dtype=np.float32)
+        else:
+            # Preprocess YOLO boxes for SAM2 (merge duplicates, widen slender boxes, limit top-k)
+            sam2_bboxes = preprocess_yolo_boxes_for_sam2(
+                bboxes, img_width, img_height,
+                iou_merge=args.iou_merge, topk=args.topk_boxes, 
+                min_w_px=args.min_w_px, pad_px=args.pad_px
+            )
+            
+            if not sam2_bboxes:
+                # No valid bboxes after preprocessing - create zero mask
+                merged_mask = np.zeros((img_height, img_width), dtype=np.uint8)
+                merged_prob = np.zeros((img_height, img_width), dtype=np.float32)
+            else:
+                # Generate SAM2 masks with probabilities
+                masks, scores, probs = generate_sam2_masks(predictor, image, sam2_bboxes, args.mask_threshold)
+                
+                # Merge masks per image (returns both binary mask and probability map)
+                merged_mask, merged_prob = merge_masks_per_image(masks, scores, probs, img_height, img_width)
+        
+        # Apply post-processing
+        processed_mask = apply_post_processing(
+            merged_mask, 
+            fill_holes_flag=args.fill_holes, 
+            morphology_flag=args.morphology
+        )
+        
+        # Save mask if requested
+        if args.save_masks and masks_output_dir is not None:
+            mask_filename = os.path.splitext(image_name)[0] + ".png"
+            mask_path = os.path.join(masks_output_dir, mask_filename)
+            cv2.imwrite(mask_path, processed_mask * 255)
+        
+        # Get ground truth for this image
+        gt_objs = gt_annotations.get(image_name, [])
+        
+        # Build GT union (even if no masks)
+        gt_merged = build_gt_union(gt_objs, img_height, img_width)
+        
+        # Store for threshold optimization (probabilities for AUPRC, binary for IoU)
+        batch_predictions.append(merged_prob)  # Keep probabilities for threshold optimization
+        batch_targets.append(gt_merged.astype(np.float32))
+        
+        # Evaluate with fixed threshold
+        metrics = evaluate_masks(processed_mask, gt_merged, metrics_calculator, args.mask_threshold)
+        if metrics:
+            batch_metrics.append(metrics)
+        
+        # Store image name for per-image results
+        batch_image_names.append(image_name)
+        
+        # Calculate inference time
+        end_time = time.time()
+        inference_time = end_time - start_time
+        batch_inference_times.append(inference_time)
+    
+    return batch_predictions, batch_targets, batch_metrics, batch_image_names, batch_inference_times
+
+
+def save_per_image_results(exp_id, model, variant, all_predictions, all_targets, 
+                          all_metrics, image_names, results_dir, timestamp):
+    """Save per-image evaluation results to CSV"""
+    if not all_metrics:
+        return None
+    
+    # Prepare per-image data
+    per_image_data = []
+    for i, metrics in enumerate(all_metrics):
+        # Get image name from image_names list
+        image_name = image_names[i] if i < len(image_names) else f"image_{i}"
+        
+        if i < len(all_predictions):
+            # Calculate additional metrics
+            pred_binary = (all_predictions[i] > 0.5).astype(np.uint8)
+            target = all_targets[i].astype(np.uint8)
+            
+            # Calculate TP, FP, FN
+            tp = np.sum((pred_binary == 1) & (target == 1))
+            fp = np.sum((pred_binary == 1) & (target == 0))
+            fn = np.sum((pred_binary == 0) & (target == 1))
+            
+            per_image_data.append({
+                'image_name': image_name,
+                'image_id': i,
+                'iou': metrics.get('iou', 0.0),
+                'dice': metrics.get('dice', 0.0),
+                'precision': metrics.get('precision', 0.0),
+                'recall': metrics.get('recall', 0.0),
+                'f1': metrics.get('f1', 0.0),
+                'tp': tp,
+                'fp': fp,
+                'fn': fn
+            })
+    
+    # Save to CSV
+    per_image_csv = f"{timestamp}_{model}_{variant}_per_image_results.csv"
+    per_image_path = os.path.join(results_dir, per_image_csv)
+    
+    with open(per_image_path, 'w', newline='') as csvfile:
+        fieldnames = ['image_name', 'image_id', 'iou', 'dice', 'precision', 'recall', 'f1', 'tp', 'fp', 'fn']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(per_image_data)
+    
+    print(f"Per-image results saved to: {per_image_path}")
+    return per_image_path
 
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate YOLO+SAM2 pipeline on Severstal test split')
-    parser.add_argument('--yolo_labels_dir', type=str, required=True,
-                       help='Directory containing YOLO prediction labels (.txt files)')
+    parser.add_argument('--yolo_labels_dir', type=str, default=None,
+                       help='Directory containing YOLO prediction labels (.txt files) - auto-detected if not provided')
+    parser.add_argument('--subset_size', type=int, default=None,
+                       help='Subset size for evaluation (e.g., 500, 1000, 2000). Uses full dataset if not specified.')
     parser.add_argument('--sam2_checkpoint', type=str, required=True,
                        help='Path to SAM2 fine-tuned checkpoint')
-    parser.add_argument('--sam2_model_type', type=str, default='vit_h',
-                       choices=['vit_h', 'vit_l', 'vit_b'],
+    parser.add_argument('--sam2_model_type', type=str, default='sam2_hiera_l',
+                       choices=['sam2_hiera_l', 'sam2_hiera_b', 'sam2_hiera_t'],
                        help='SAM2 model type')
-    parser.add_argument('--gt_annotations', type=str, required=True,
-                       help='Path to ground truth annotations JSON file')
-    parser.add_argument('--test_images_dir', type=str, required=True,
-                       help='Directory containing test images')
+    parser.add_argument('--gt_annotations', type=str, default=None,
+                       help='Path to ground truth annotations directory (auto-detected if not provided)')
+    parser.add_argument('--test_images_dir', type=str, default=None,
+                       help='Directory containing test images (auto-detected if not provided)')
     parser.add_argument('--output_dir', type=str, 
-                       default='new_src/evaluation/evaluation_results/yolo_sam2_eval',
+                       default='new_src/evaluation/evaluation_results/yolo_sam2_pipeline',
                        help='Directory to save evaluation results')
-    parser.add_argument('--conf_threshold', type=float, default=0.25,
-                       help='YOLO confidence threshold used')
+    parser.add_argument('--conf_threshold', type=float, default=0.15,
+                       help='YOLO confidence threshold used (should match YOLO evaluation)')
     parser.add_argument('--iou_threshold', type=float, default=0.70,
                        help='YOLO IoU threshold used')
     parser.add_argument('--max_detections', type=int, default=300,
                        help='YOLO max detections used')
     parser.add_argument('--mask_threshold', type=float, default=0.5,
                        help='Fixed mask threshold for evaluation')
-    parser.add_argument('--fill_holes', action='store_true', default=True,
+    parser.add_argument('--fill_holes', action='store_true', default=False,
                        help='Apply hole filling post-processing')
-    parser.add_argument('--morphology', action='store_true', default=True,
+    parser.add_argument('--morphology', action='store_true', default=False,
                        help='Apply morphological post-processing')
-    parser.add_argument('--save_masks', action='store_true',
+    parser.add_argument('--save_masks', action='store_true', default=True,
                        help='Save predicted masks for visualization')
+    parser.add_argument('--iou_merge', type=float, default=0.85,
+                       help='IoU threshold for merging duplicate boxes')
+    parser.add_argument('--topk_boxes', type=int, default=20,
+                       help='Maximum number of boxes per image after preprocessing')
+    parser.add_argument('--min_w_px', type=int, default=8,
+                       help='Minimum width in pixels for widening slender boxes')
+    parser.add_argument('--pad_px', type=int, default=6,
+                       help='Padding in pixels when widening slender boxes')
+    parser.add_argument('--opt_threshold', type=float, default=None,
+                       help='Pre-calculated optimal threshold from validation (avoids test overfitting)')
+    parser.add_argument('--batch_size', type=int, default=50,
+                       help='Number of images to process in each batch (to avoid OOM)')
+    parser.add_argument('--save_batch_results', action='store_true',
+                       help='Save intermediate results after each batch')
     
     args = parser.parse_args()
+    
+    # Auto-detect paths if not provided
+    if args.subset_size is not None:
+        # Use subset paths
+        if args.yolo_labels_dir is None:
+            args.yolo_labels_dir = f"new_src/evaluation/evaluation_results/yolo_detection/predict_test_corrected_subset_{args.subset_size}/labels"
+        if args.gt_annotations is None:
+            args.gt_annotations = "datasets/Data/splits/test_split/ann"
+        if args.test_images_dir is None:
+            args.test_images_dir = f"datasets/yolo_detection_fixed/subset_{args.subset_size}/images/test_split"
+    else:
+        # Use full dataset paths
+        if args.yolo_labels_dir is None:
+            args.yolo_labels_dir = "new_src/evaluation/evaluation_results/yolo_detection/predict_test_corrected/labels"
+        if args.gt_annotations is None:
+            args.gt_annotations = "datasets/Data/splits/test_split/ann"
+        if args.test_images_dir is None:
+            args.test_images_dir = "datasets/yolo_detection_fixed/images/test_split"
     
     # Set seed
     set_seed(42)
@@ -407,7 +763,7 @@ def main():
         return
     
     if not os.path.exists(args.gt_annotations):
-        print(f"Error: Ground truth annotations not found: {args.gt_annotations}")
+        print(f"Error: Ground truth annotations directory not found: {args.gt_annotations}")
         return
     
     if not os.path.exists(args.test_images_dir):
@@ -423,6 +779,12 @@ def main():
     print(f"  Test images: {args.test_images_dir}")
     print(f"  Mask threshold: {args.mask_threshold}")
     print(f"  Post-processing: fill_holes={args.fill_holes}, morphology={args.morphology}")
+    print(f"  Box preprocessing: iou_merge={args.iou_merge}, topk={args.topk_boxes}, min_w_px={args.min_w_px}, pad_px={args.pad_px}")
+    print(f"  Threshold: {'Pre-calculated from validation' if args.opt_threshold is not None else 'Will optimize on test set'}")
+    if args.subset_size:
+        print(f"  Subset size: {args.subset_size}")
+    else:
+        print(f"  Using full dataset")
     
     # Load SAM2 model
     print(f"\nLoading SAM2 model...")
@@ -439,126 +801,179 @@ def main():
     # Initialize metrics calculator
     metrics_calculator = SegmentationMetrics()
     
+    # Create masks output directory if saving masks
+    masks_output_dir = None
+    if args.save_masks:
+        if args.subset_size is not None:
+            masks_output_dir = os.path.join(args.output_dir, f"masks_subset_{args.subset_size}")
+        else:
+            masks_output_dir = os.path.join(args.output_dir, "masks_full")
+        os.makedirs(masks_output_dir, exist_ok=True)
+        print(f"Masks will be saved to: {masks_output_dir}")
+    
     # Evaluation variables
     all_predictions = []
     all_targets = []
     all_metrics = []
+    image_names = []
+    all_inference_times = []
     
-    # Process each image
-    print(f"\nProcessing images...")
-    for image_name in tqdm(list(yolo_predictions.keys())):
-        # Load image
-        image_path = os.path.join(args.test_images_dir, image_name)
-        if not os.path.exists(image_path):
-            print(f"Warning: Image not found: {image_path}")
-            continue
+    # Process images in batches to avoid OOM
+    print(f"\nProcessing images in batches of {args.batch_size}...")
+    all_image_names = list(yolo_predictions.keys())
+    total_images = len(all_image_names)
+    
+    for batch_start in tqdm(range(0, total_images, args.batch_size), desc="Processing batches"):
+        batch_end = min(batch_start + args.batch_size, total_images)
+        batch_images = all_image_names[batch_start:batch_end]
         
-        image = cv2.imread(image_path)
-        if image is None:
-            print(f"Warning: Could not load image: {image_path}")
-            continue
+        print(f"\nProcessing batch {batch_start//args.batch_size + 1}: images {batch_start+1}-{batch_end} of {total_images}")
         
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        img_height, img_width = image.shape[:2]
-        
-        # Get YOLO bboxes for this image
-        bboxes = yolo_predictions[image_name]
-        if not bboxes:
-            continue
-        
-        # Convert bboxes to SAM2 format
-        sam2_bboxes = []
-        for bbox in bboxes:
-            sam2_bbox = convert_bbox_to_sam2_format(bbox, img_width, img_height)
-            sam2_bboxes.append(sam2_bbox)
-        
-        # Generate SAM2 masks
-        masks, scores = generate_sam2_masks(predictor, image, sam2_bboxes, args.mask_threshold)
-        
-        # Merge masks per image
-        merged_mask = merge_masks_per_image(masks, scores, img_height, img_width)
-        
-        # Apply post-processing
-        processed_mask = apply_post_processing(
-            merged_mask, 
-            fill_holes_flag=args.fill_holes, 
-            morphology_flag=args.morphology
+        # Process batch
+        batch_predictions, batch_targets, batch_metrics, batch_image_names, batch_inference_times = process_batch(
+            batch_images, predictor, yolo_predictions, gt_annotations, args, metrics_calculator, masks_output_dir
         )
         
-        # Get ground truth for this image
-        gt_masks = gt_annotations.get(image_name, [])
-        if not gt_masks:
-            continue
+        # Accumulate results
+        all_predictions.extend(batch_predictions)
+        all_targets.extend(batch_targets)
+        all_metrics.extend(batch_metrics)
+        image_names.extend(batch_image_names)
+        all_inference_times.extend(batch_inference_times)
         
-        # Merge ground truth masks (union)
-        gt_merged = np.zeros((img_height, img_width), dtype=np.uint8)
-        for gt_mask in gt_masks:
-            # Resize GT mask to match image size if needed
-            if gt_mask.shape != (img_height, img_width):
-                gt_mask = cv2.resize(gt_mask.astype(np.uint8), (img_width, img_height), interpolation=cv2.INTER_NEAREST)
-            gt_merged = np.logical_or(gt_merged, gt_mask.astype(bool))
+        # Clean up memory after each batch
+        cleanup_memory()
         
-        gt_merged = gt_merged.astype(np.uint8)
+        # Save intermediate results if requested
+        if args.save_batch_results:
+            print(f"  Batch completed: {len(batch_metrics)} valid images processed")
+            print(f"  Memory cleanup performed")
         
-        # Store for threshold optimization
-        all_predictions.append(processed_mask.astype(np.float32))
-        all_targets.append(gt_merged.astype(np.float32))
+        # Save incremental results every 10 batches to avoid data loss
+        if (batch_start // args.batch_size + 1) % 10 == 0:
+            print(f"  Saving incremental results (batch {batch_start // args.batch_size + 1})...")
+            save_incremental_results(all_metrics, image_names, args.output_dir, batch_start // args.batch_size + 1)
         
-        # Evaluate with fixed threshold
-        metrics = evaluate_masks(processed_mask, gt_merged, metrics_calculator, args.mask_threshold)
-        if metrics:
-            all_metrics.append(metrics)
+        # Clear batch variables to free memory
+        del batch_predictions, batch_targets, batch_metrics, batch_image_names, batch_inference_times
     
     if not all_metrics:
         print("No valid predictions to evaluate")
         return
     
     # Calculate average metrics with fixed threshold
-    avg_metrics_fixed = {}
-    for key in all_metrics[0].keys():
-        avg_metrics_fixed[key] = np.mean([m[key] for m in all_metrics])
+    print(f"\nCalculating average metrics...")
+    print(f"Number of valid metrics: {len(all_metrics)}")
+    if all_metrics:
+        print(f"Sample metrics keys: {list(all_metrics[0].keys())}")
+        avg_metrics_fixed = {}
+        for key in all_metrics[0].keys():
+            avg_metrics_fixed[key] = np.mean([m[key] for m in all_metrics])
+        print(f"Average metrics calculated: {list(avg_metrics_fixed.keys())}")
+    else:
+        print("No valid metrics to average!")
+        return
     
-    # Find optimal threshold
-    print(f"\nFinding optimal threshold...")
-    all_preds_flat = np.concatenate([pred.flatten() for pred in all_predictions])
-    all_targets_flat = np.concatenate([target.flatten() for target in all_targets])
+    # Use pre-calculated threshold (avoid memory issues)
+    print(f"\nDetermining optimal threshold...")
     
-    opt_threshold_f1, best_f1 = find_optimal_threshold(all_preds_flat, all_targets_flat, 'f1')
-    opt_threshold_dice, best_dice = find_optimal_threshold(all_preds_flat, all_targets_flat, 'dice')
+    if args.opt_threshold is not None:
+        opt_threshold_f1 = args.opt_threshold
+        print(f"Using pre-calculated optimal threshold from validation: {opt_threshold_f1:.3f}")
+    else:
+        # Use fixed threshold to avoid memory issues with 2000 images
+        opt_threshold_f1 = 0.5
+        print(f"Using fixed threshold (no optimization on test set): {opt_threshold_f1:.3f}")
+        print("INFO: Using fixed threshold to avoid memory issues. Use --opt_threshold for pre-calculated value.")
     
-    print(f"Optimal threshold (F1): {opt_threshold_f1:.3f} (F1: {best_f1:.4f})")
-    print(f"Optimal threshold (Dice): {opt_threshold_dice:.3f} (Dice: {best_dice:.4f})")
+    # Calculate metrics with optimal threshold (reuse existing metrics for fixed threshold case)
+    if opt_threshold_f1 == args.mask_threshold:
+        # Reuse already calculated metrics to save memory
+        avg_metrics_opt = avg_metrics_fixed.copy()
+        print("Reusing fixed threshold metrics to save memory")
+    else:
+        # Only recalculate if threshold is different
+        print("Recalculating metrics with different threshold...")
+        all_metrics_opt = []
+        
+        # Process in smaller chunks to avoid memory issues
+        chunk_size = 100
+        for i in range(0, len(all_predictions), chunk_size):
+            chunk_preds = all_predictions[i:i+chunk_size]
+            chunk_targets = all_targets[i:i+chunk_size]
+            
+            for pred, target in zip(chunk_preds, chunk_targets):
+                pred_binary = (pred > opt_threshold_f1).astype(np.uint8)
+                metrics = evaluate_masks(pred_binary, target, metrics_calculator, 0.5)
+                if metrics:
+                    all_metrics_opt.append(metrics)
+            
+            # Clean up chunk memory
+            del chunk_preds, chunk_targets
+            cleanup_memory()
+        
+        # Calculate average
+        avg_metrics_opt = {}
+        for key in all_metrics_opt[0].keys():
+            avg_metrics_opt[key] = np.mean([m[key] for m in all_metrics_opt])
     
-    # Calculate metrics with optimal threshold
-    all_metrics_opt = []
-    for pred, target in zip(all_predictions, all_targets):
-        pred_binary = (pred > opt_threshold_f1).astype(np.uint8)
-        metrics = evaluate_masks(pred_binary, target, metrics_calculator, 0.5)
-        if metrics:
-            all_metrics_opt.append(metrics)
+    # Calculate extra metrics in chunks to avoid memory issues
+    print("Calculating extra metrics...")
+    iou_50_scores = []
+    iou_75_scores = []
+    iou_90_scores = []
+    iou_95_scores = []
+    auprc_scores = []
     
-    avg_metrics_opt = {}
-    for key in all_metrics_opt[0].keys():
-        avg_metrics_opt[key] = np.mean([m[key] for m in all_metrics_opt])
+    chunk_size = 100
+    for i in range(0, len(all_predictions), chunk_size):
+        chunk_preds = all_predictions[i:i+chunk_size]
+        chunk_targets = all_targets[i:i+chunk_size]
+        
+        for pred, target in zip(chunk_preds, chunk_targets):
+            # IoU at different thresholds
+            iou_50_scores.append(calculate_iou_at_threshold(pred, target, 0.5))
+            iou_75_scores.append(calculate_iou_at_threshold(pred, target, 0.75))
+            iou_90_scores.append(calculate_iou_at_threshold(pred, target, 0.90))
+            iou_95_scores.append(calculate_iou_at_threshold(pred, target, 0.95))
+            
+            # AUPRC per image
+            try:
+                auprc = average_precision_score(target.flatten(), pred.flatten())
+                auprc_scores.append(auprc)
+            except:
+                auprc_scores.append(0.0)
+        
+        # Clean up chunk memory
+        del chunk_preds, chunk_targets
+        cleanup_memory()
     
-    # Calculate extra metrics
-    extra_metrics = calculate_extra_metrics(
-        np.array(all_predictions), 
-        np.array(all_targets), 
-        threshold=opt_threshold_f1
-    )
+    # Average extra metrics
+    extra_metrics = {
+        'iou_50': np.mean(iou_50_scores),
+        'iou_75': np.mean(iou_75_scores),
+        'iou_90': np.mean(iou_90_scores),
+        'iou_95': np.mean(iou_95_scores),
+        'auprc': np.mean(auprc_scores)
+    }
     
     # Update optimal metrics with extra metrics
     avg_metrics_opt.update(extra_metrics)
     
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
-    exp_id = f"eval_yolo_sam2_test_split_{timestamp}"
+    if args.subset_size is not None:
+        exp_id = f"eval_yolo_sam2_subset_{args.subset_size}_{timestamp}"
+    else:
+        exp_id = f"eval_yolo_sam2_test_split_{timestamp}"
+    
+    # Determine subset size string for results
+    subset_str = str(args.subset_size) if args.subset_size is not None else "test_split"
     
     csv_path = save_evaluation_results(
         exp_id=exp_id,
         model="yolo_sam2",
-        subset_size="test_split",
+        subset_size=subset_str,
         variant="pipeline",
         prompt_type="box_prompts",
         img_size=1024,
@@ -570,7 +985,18 @@ def main():
         opt_threshold=opt_threshold_f1,
         predictions_dir=args.output_dir,
         save_dir=args.output_dir,
-        timestamp=timestamp
+        timestamp=timestamp,
+        all_predictions=all_predictions,
+        all_targets=all_targets,
+        all_metrics=all_metrics,
+        image_names=image_names,
+        all_inference_times=all_inference_times,
+        fill_holes=args.fill_holes,
+        morphology=args.morphology,
+        iou_merge=args.iou_merge,
+        topk_boxes=args.topk_boxes,
+        min_w_px=args.min_w_px,
+        pad_px=args.pad_px
     )
     
     # Print final results
@@ -578,22 +1004,33 @@ def main():
     print(f"Results saved to: {csv_path}")
     
     print(f"\nFixed threshold ({args.mask_threshold}) results:")
-    print(f"  IoU: {avg_metrics_fixed.get('mean_iou', 0.0):.4f}")
-    print(f"  Dice: {avg_metrics_fixed.get('mean_dice', 0.0):.4f}")
+    print(f"  IoU: {avg_metrics_fixed.get('iou', 0.0):.4f}")
+    print(f"  Dice: {avg_metrics_fixed.get('dice', 0.0):.4f}")
     print(f"  Precision: {avg_metrics_fixed.get('precision', 0.0):.4f}")
     print(f"  Recall: {avg_metrics_fixed.get('recall', 0.0):.4f}")
     print(f"  F1: {avg_metrics_fixed.get('f1', 0.0):.4f}")
     
     print(f"\nOptimal threshold ({opt_threshold_f1:.3f}) results:")
-    print(f"  IoU: {avg_metrics_opt.get('mean_iou', 0.0):.4f}")
-    print(f"  Dice: {avg_metrics_opt.get('mean_dice', 0.0):.4f}")
+    print(f"  IoU: {avg_metrics_opt.get('iou', 0.0):.4f}")
+    print(f"  Dice: {avg_metrics_opt.get('dice', 0.0):.4f}")
     print(f"  Precision: {avg_metrics_opt.get('precision', 0.0):.4f}")
     print(f"  Recall: {avg_metrics_opt.get('recall', 0.0):.4f}")
     print(f"  F1: {avg_metrics_opt.get('f1', 0.0):.4f}")
     print(f"  IoU@50: {avg_metrics_opt.get('iou_50', 0.0):.4f}")
     print(f"  IoU@75: {avg_metrics_opt.get('iou_75', 0.0):.4f}")
     print(f"  IoU@90: {avg_metrics_opt.get('iou_90', 0.0):.4f}")
+    print(f"  IoU@95: {avg_metrics_opt.get('iou_95', 0.0):.4f}")
     print(f"  AUPRC: {avg_metrics_opt.get('auprc', 0.0):.4f}")
+    
+    # Print inference time statistics
+    if all_inference_times and len(all_inference_times) > 0:
+        mean_time = np.mean(all_inference_times)
+        std_time = np.std(all_inference_times)
+        total_time = np.sum(all_inference_times)
+        print(f"\nInference time statistics:")
+        print(f"  Mean time per image: {mean_time:.3f} ± {std_time:.3f} seconds")
+        print(f"  Total time: {total_time:.1f} seconds")
+        print(f"  Images processed: {len(all_inference_times)}")
     
     print(f"\nPipeline evaluation completed!")
     print(f"YOLO bboxes → SAM2 box-prompts → mask merging → evaluation")

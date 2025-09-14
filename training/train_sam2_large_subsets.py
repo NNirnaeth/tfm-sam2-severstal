@@ -288,7 +288,15 @@ def evaluate_on_validation_set(predictor, val_data, annotation_format="bitmap"):
         return 0.0, 0.0
 
 
-def train_sam2_large_on_subset(subset_size, learning_rate, weight_decay, steps, batch_size=1):
+def train_sam2_large_on_subset(
+    subset_size,
+    learning_rate,
+    weight_decay,
+    steps,
+    batch_size=1,
+    base_model_path=None,
+    config_path=None,
+):
     """
     Train SAM2 large model on a specific subset size.
     
@@ -311,13 +319,22 @@ def train_sam2_large_on_subset(subset_size, learning_rate, weight_decay, steps, 
     print(f"Training Steps: {steps}")
     print(f"Effective Batch Size: {batch_size * 4} (batch_size={batch_size}, accumulation=4)")
     
+    # Resolve project root
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
     # Configuration
-    base_model = "models/sam2_base_models/sam2_hiera_large.pt"
-    config = "configs/sam2/sam2_hiera_l.yaml"
+    default_base_model = os.path.join(project_root, "models", "base", "sam2", "sam2_hiera_large.pt")
+    base_model = base_model_path or default_base_model
+
+    default_config = os.path.join(project_root, "libs", "sam2base", "sam2", "configs", "sam2", "sam2_hiera_l.yaml")
+    config = config_path or default_config
     
     # Check if base model exists
     if not os.path.exists(base_model):
         print(f"Error: Base model not found: {base_model}")
+        return None
+    if not os.path.exists(config):
+        print(f"Error: Config file not found: {config}")
         return None
     
     # Prepare dataset with internal validation
@@ -329,8 +346,20 @@ def train_sam2_large_on_subset(subset_size, learning_rate, weight_decay, steps, 
     
     # Build model
     print(f"Building SAM2 large model...")
-    sam2_model = build_sam2(config, base_model, device="cuda")
-    predictor = SAM2ImagePredictor(sam2_model)
+    # Change to sam2base directory for proper config resolution (as in working scripts)
+    original_dir = os.getcwd()
+    sam2base_dir = os.path.join(project_root, "libs", "sam2base")
+    os.chdir(sam2base_dir)
+    
+    try:
+        # Use relative paths from sam2base directory (as in working scripts)
+        config_file = "configs/sam2/sam2_hiera_l.yaml"
+        sam2_model = build_sam2(config_file, ckpt_path=base_model, device="cpu")
+        sam2_model.to("cuda")
+        predictor = SAM2ImagePredictor(sam2_model)
+    finally:
+        # Restore original directory
+        os.chdir(original_dir)
     
     # Set training mode
     predictor.model.sam_mask_decoder.train(True)
@@ -361,14 +390,14 @@ def train_sam2_large_on_subset(subset_size, learning_rate, weight_decay, steps, 
     mean_iou = 0.0
     
     # Early stopping configuration
-    early_stopping_patience = 3
+    early_stopping_patience = 30
     early_stopping_counter = 0
     early_stopping_min_delta = 1e-4  # Minimum improvement threshold
     
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     model_name = f"sam2_large_subset_{subset_size}_lr{str(learning_rate).replace('e-', 'e')}_{timestamp}"
-    ckpt_dir = f"new_src/training/training_results/sam2_subsets/{model_name}"
+    ckpt_dir = f"models/trained/sam2_subsets/{model_name}"
     os.makedirs(ckpt_dir, exist_ok=True)
     
     # Metrics logger
@@ -584,6 +613,10 @@ def main():
                        help="Number of training steps")
     parser.add_argument("--batch_size", type=int, default=1,
                        help="Batch size (effective batch = batch_size * 4)")
+    parser.add_argument("--base_model", type=str, default="",
+                       help="Path to base SAM2 Large checkpoint (.pt)")
+    parser.add_argument("--config", type=str, default="",
+                       help="Path to SAM2 Large config yaml")
     
     args = parser.parse_args()
     
@@ -598,7 +631,7 @@ def main():
     print(f"Weight decay: {args.weight_decay}")
     
     # Create output directories
-    os.makedirs("new_src/training/training_results/sam2_subsets", exist_ok=True)
+    os.makedirs("models/trained/sam2_subsets", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     
     results = {}
@@ -615,11 +648,13 @@ def main():
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 steps=args.steps,
-                batch_size=args.batch_size
+                batch_size=args.batch_size,
+                base_model_path=(args.base_model or None),
+                config_path=(args.config or None),
             )
             results[subset_size] = {
-                'success': True,
-                'checkpoint_dir': result
+                'success': bool(result),
+                'checkpoint_dir': result if result else None,
             }
         except Exception as e:
             print(f"Error training on subset {subset_size}: {e}")
@@ -633,13 +668,13 @@ def main():
     print(f"TRAINING COMPLETED")
     print(f"{'='*80}")
     for subset_size, result in results.items():
-        if result['success']:
-            print(f"Subset {subset_size}: SUCCESS - {result['checkpoint_dir']}")
+        if result.get('success'):
+            print(f"Subset {subset_size}: SUCCESS - {result.get('checkpoint_dir')}")
         else:
-            print(f"Subset {subset_size}: FAILED - {result['error']}")
+            print(f"Subset {subset_size}: FAILED - {result.get('error', 'Unknown error')}")
     
     # Save overall results
-    results_file = f"new_src/training/training_results/sam2_subsets/sam2_large_subsets_training_results_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+    results_file = f"models/trained/sam2_subsets/sam2_large_subsets_training_results_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
     os.makedirs("results", exist_ok=True)
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)

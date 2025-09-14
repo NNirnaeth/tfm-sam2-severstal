@@ -311,13 +311,22 @@ def train_sam2_small_on_subset(subset_size, learning_rate, weight_decay, steps, 
     print(f"Training Steps: {steps}")
     print(f"Effective Batch Size: {batch_size * 4} (batch_size={batch_size}, accumulation=4)")
     
+    # Resolve project root
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
     # Configuration
-    base_model = "models/sam2_base_models/sam2_hiera_small.pt"
-    config = "configs/sam2/sam2_hiera_s.yaml"
+    default_base_model = os.path.join(project_root, "models", "base", "sam2", "sam2_hiera_small.pt")
+    base_model = default_base_model
+
+    default_config = os.path.join(project_root, "libs", "sam2base", "sam2", "configs", "sam2", "sam2_hiera_s.yaml")
+    config = default_config
     
     # Check if base model exists
     if not os.path.exists(base_model):
         print(f"Error: Base model not found: {base_model}")
+        return None
+    if not os.path.exists(config):
+        print(f"Error: Config file not found: {config}")
         return None
     
     # Prepare dataset with internal validation
@@ -329,8 +338,20 @@ def train_sam2_small_on_subset(subset_size, learning_rate, weight_decay, steps, 
     
     # Build model
     print(f"Building SAM2 small model...")
-    sam2_model = build_sam2(config, base_model, device="cuda")
-    predictor = SAM2ImagePredictor(sam2_model)
+    # Change to sam2base directory for proper config resolution (as in working scripts)
+    original_dir = os.getcwd()
+    sam2base_dir = os.path.join(project_root, "libs", "sam2base")
+    os.chdir(sam2base_dir)
+    
+    try:
+        # Use relative paths from sam2base directory (as in working scripts)
+        config_file = "configs/sam2/sam2_hiera_s.yaml"
+        sam2_model = build_sam2(config_file, ckpt_path=base_model, device="cpu")
+        sam2_model.to("cuda")
+        predictor = SAM2ImagePredictor(sam2_model)
+    finally:
+        # Restore original directory
+        os.chdir(original_dir)
     
     # Set training mode
     predictor.model.sam_mask_decoder.train(True)
@@ -361,14 +382,14 @@ def train_sam2_small_on_subset(subset_size, learning_rate, weight_decay, steps, 
     mean_iou = 0.0
     
     # Early stopping configuration
-    early_stopping_patience = 3
+    early_stopping_patience = 30
     early_stopping_counter = 0
     early_stopping_min_delta = 1e-4  # Minimum improvement threshold
     
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     model_name = f"sam2_small_subset_{subset_size}_lr{str(learning_rate).replace('e-', 'e')}_{timestamp}"
-    ckpt_dir = f"new_src/training/training_results/sam2_subsets/{model_name}"
+    ckpt_dir = f"models/trained/sam2_subsets/{model_name}"
     os.makedirs(ckpt_dir, exist_ok=True)
     
     # Metrics logger
@@ -437,14 +458,27 @@ def train_sam2_small_on_subset(subset_size, learning_rate, weight_decay, steps, 
                 seg_loss = (-gt_mask * torch.log(prd_mask + 1e-6) - 
                            (1 - gt_mask) * torch.log((1 - prd_mask) + 1e-5)).mean()
                 
-                # IoU loss - CORREGIDO: Con clamping y protección contra división por cero
-                inter = (gt_mask * (prd_mask > 0.5)).sum(1).sum(1)
-                union = gt_mask.sum(1).sum(1) + (prd_mask > 0.5).sum(1).sum(1) - inter
-                iou = inter / (union + 1e-6)  # Protección contra división por cero
-                iou = torch.clamp(iou, 0.0, 1.0)  # Clamping para asegurar IoU <= 1.0
+                # IoU loss - Simplified to avoid dimension errors
+                try:
+                    # Flatten masks for IoU calculation
+                    gt_flat = gt_mask.flatten()
+                    pred_flat = (prd_mask > 0.5).float().flatten()
+                    
+                    # Calculate IoU
+                    inter = (gt_flat * pred_flat).sum()
+                    union = gt_flat.sum() + pred_flat.sum() - inter
+                    iou = inter / (union + 1e-6)
+                    iou = torch.clamp(iou, 0.0, 1.0)
+                except Exception as e:
+                    print(f"  IoU calculation error: {e}")
+                    iou = torch.tensor(0.0, device='cuda')
                 
                 # Score loss (predicted vs actual IoU)
-                score_loss = torch.abs(prd_scores[:, 0] - iou).mean()
+                try:
+                    score_loss = torch.abs(prd_scores[:, 0] - iou).mean()
+                except Exception as e:
+                    print(f"  Score loss error: {e}")
+                    score_loss = torch.tensor(0.0, device='cuda')
                 
                 # Combined loss
                 loss = seg_loss + score_loss * 0.05
@@ -546,7 +580,7 @@ def train_sam2_small_on_subset(subset_size, learning_rate, weight_decay, steps, 
         "early_stopping_patience": early_stopping_patience,
         "timestamp": timestamp,
         "checkpoint_dir": ckpt_dir,
-        "note": "Subset training with same metrics and parameters as full dataset for fair comparison. Early stopping with patience=3."
+        "note": "Subset training with same metrics and parameters as full dataset for fair comparison. Early stopping with patience=30."
     }
     
     summary_path = os.path.join(ckpt_dir, "training_summary.json")
@@ -592,7 +626,7 @@ def main():
     print(f"Weight decay: {args.weight_decay}")
     
     # Create output directories
-    os.makedirs("new_src/training/training_results/sam2_subsets", exist_ok=True)
+    os.makedirs("models/trained/sam2_subsets", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     
     results = {}
@@ -633,7 +667,7 @@ def main():
             print(f"Subset {subset_size}: FAILED - {result['error']}")
     
     # Save overall results
-    results_file = f"new_src/training/training_results/sam2_subsets/sam2_small_subsets_training_results_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+    results_file = f"models/trained/sam2_subsets/sam2_small_subsets_training_results_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
     os.makedirs("results", exist_ok=True)
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)

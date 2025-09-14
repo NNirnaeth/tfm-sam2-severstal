@@ -30,6 +30,16 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.
 from utils import read_batch
 from metrics_logger import MetricsLogger
 
+def set_seed(seed=42):
+    """Set seeds for reproducibility"""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def read_batch_corrected(data, annotation_format='bitmap', visualize_data=False):
     """
     Corrected version of read_batch that maintains consistent dimensions
@@ -116,7 +126,7 @@ def read_batch_corrected(data, annotation_format='bitmap', visualize_data=False)
     
     if len(coords) > 0:
         np.random.shuffle(coords)
-        points = coords[:10]  # Take up to 10 points
+        points = coords[:10]  # Keep multiple points for robust supervision
         # Convert from (y, x) to (x, y) format and ensure positive strides
         points = points[:, [1, 0]].copy()  # Swap y,x to x,y and make copy
         points = np.expand_dims(points, axis=1)
@@ -136,8 +146,8 @@ def prepare_full_dataset_with_validation():
     Uses train_split for training and val_split for internal validation.
     """
     # Use the correct directory structure from datasets/Data/splits
-    train_dir = "datasets/Data/splits/train_split"
-    val_dir = "datasets/Data/splits/val_split"
+    train_dir = "/home/ptp/sam2/datasets/Data/splits/train_split"
+    val_dir = "/home/ptp/sam2/datasets/Data/splits/val_split"
     
     def load_pairs(directory):
         """Load image-annotation pairs from a directory"""
@@ -312,8 +322,8 @@ def train_sam2_model(model_size, learning_rate, weight_decay, steps, batch_size=
     print(f"Effective Batch Size: {batch_size * 4} (batch_size={batch_size}, accumulation=4)")
     
     # Configuration
-    base_model = f"models/sam2_base_models/sam2_hiera_{model_size}.pt"
-    config = f"configs/sam2/sam2_hiera_{model_size[0]}.yaml"
+    base_model = f"/home/ptp/sam2/models/base/sam2/sam2_hiera_{model_size}.pt"
+    config = f"configs/sam2/sam2_hiera_{model_size[0]}.yaml"  # Relative to sam2base directory
     
     # Check if base model exists
     if not os.path.exists(base_model):
@@ -328,13 +338,19 @@ def train_sam2_model(model_size, learning_rate, weight_decay, steps, batch_size=
     sam2_model = build_sam2(config, base_model, device="cuda")
     predictor = SAM2ImagePredictor(sam2_model)
     
-    # Set training mode
-    predictor.model.sam_mask_decoder.train(True)
-    predictor.model.sam_prompt_encoder.train(True)
+    # FREEZE ALL PARAMETERS EXCEPT PROMPT ENCODER AND MASK DECODER
+    for name, p in predictor.model.named_parameters():
+        if ("sam_prompt_encoder" in name) or ("sam_mask_decoder" in name):
+            p.requires_grad = True
+        else:
+            p.requires_grad = False
     
-    # Optimizer and scheduler
+    # Create optimizer ONLY with trainable parameters
+    trainable_params = [p for p in predictor.model.parameters() if p.requires_grad]
+    print(f"Model: {sum(p.numel() for p in trainable_params):,} trainable / {sum(p.numel() for p in predictor.model.parameters()):,} total parameters")
+    
     optimizer = torch.optim.AdamW(
-        predictor.model.parameters(), 
+        trainable_params, 
         lr=learning_rate, 
         weight_decay=weight_decay
     )
@@ -361,18 +377,19 @@ def train_sam2_model(model_size, learning_rate, weight_decay, steps, batch_size=
     early_stopping_counter = 0
     early_stopping_min_delta = 1e-4  # Minimum improvement threshold
     
-    # Create output directory
+    # Create output directory - ENSURE CORRECT PATH
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     model_name = f"sam2_{model_size}_full_dataset_lr{str(learning_rate).replace('e-', 'e')}_{timestamp}"
-    ckpt_dir = f"new_src/training/training_results/sam2_full_dataset/{model_name}"
+    ckpt_dir = f"training_results/sam2_full_dataset/{model_name}"
     os.makedirs(ckpt_dir, exist_ok=True)
+    
+    print(f"Checkpoints will be saved to: {os.path.abspath(ckpt_dir)}")
     
     # Metrics logger
     logger = MetricsLogger(f"logs/training_metrics_full_dataset_{model_size}.csv")
     
     # Training loop
     print(f"\nStarting training...")
-    print(f"Checkpoints will be saved to: {ckpt_dir}")
     
     for step in range(1, steps + 1):
         try:
@@ -390,8 +407,9 @@ def train_sam2_model(model_size, learning_rate, weight_decay, steps, batch_size=
                 if input_point.size == 0 or input_label.size == 0:
                     continue
                 
-                # Set image and prepare prompts
-                predictor.set_image(image)
+                # Set image and prepare prompts (no gradients for image encoder)
+                with torch.no_grad():
+                    predictor.set_image(image)
                 mask_input, unnorm_coords, labels, _ = predictor._prep_prompts(
                     input_point, input_label, box=None, mask_logits=None, normalize_coords=True
                 )
@@ -420,40 +438,49 @@ def train_sam2_model(model_size, learning_rate, weight_decay, steps, batch_size=
                 # Post-process masks using SAM2's internal dimensions
                 prd_masks = predictor._transforms.postprocess_masks(low_res_masks, predictor._orig_hw[-1])
                 
-                # Calculate loss (consistent with src/train.py)
-                gt_mask = torch.tensor(mask.astype(np.float32)).cuda()
-                prd_mask = torch.sigmoid(prd_masks[:, 0])
-                
-                # Ensure both masks have the same dimensions for loss calculation
-                if gt_mask.dim() == 2:
-                    gt_mask = gt_mask.unsqueeze(0)  # Add batch dimension [1, H, W]
-                if prd_mask.dim() == 2:
-                    prd_mask = prd_mask.unsqueeze(0)  # Add batch dimension [1, H, W]
-                
-                # Segmentation loss (Binary Cross Entropy)
-                seg_loss = (-gt_mask * torch.log(prd_mask + 1e-6) - 
-                           (1 - gt_mask) * torch.log((1 - prd_mask) + 1e-5)).mean()
-                
-                # IoU loss
-                inter = (gt_mask * (prd_mask > 0.5)).sum(1).sum(1)
-                iou = inter / (gt_mask.sum(1).sum(1) + (prd_mask > 0.5).sum(1).sum(1) - inter)
-                
-                # Score loss (predicted vs actual IoU)
-                score_loss = torch.abs(prd_scores[:, 0] - iou).mean()
-                
-                # Combined loss
-                loss = seg_loss + score_loss * 0.05
-                loss = loss / accumulation_steps
+                # ---- logits y agregación por instancia ----
+                # prd_masks: [K, 1, H, W] después de postprocess
+                prd_logits = prd_masks[:, 0]                 # [K, H, W]  (sin sigmoid)
+                prd_logits_agg = prd_logits.max(dim=0).values  # [H, W]    (máximo sobre K)
+
+                # Ground truth a 2D [H, W] en float32 (y en CUDA)
+                gt_mask = torch.tensor(mask.astype(np.float32), device='cuda')
+                if gt_mask.dim() == 3:   # [1, H, W]
+                    gt_mask_2d = gt_mask.squeeze(0)    # [H, W]
+                elif gt_mask.dim() == 2:
+                    gt_mask_2d = gt_mask
+                else:
+                    raise RuntimeError(f"GT mask dim inesperada: {gt_mask.shape}")
+
+                # ---- PÉRDIDA PRINCIPAL: BCEWithLogits (segura en autocast) ----
+                import torch.nn.functional as F
+                seg_loss = F.binary_cross_entropy_with_logits(prd_logits_agg, gt_mask_2d, reduction="mean")
+
+                # ---- Métricas / pérdidas auxiliares (usa probas cuando toque) ----
+                # Para IoU/score usa probas binarizadas desde logits agregados
+                prd_prob_agg = torch.sigmoid(prd_logits_agg)       # [H, W]
+                pred_binary = (prd_prob_agg > 0.5).float()
+
+                # IoU estable
+                inter = (gt_mask_2d * pred_binary).sum()
+                den = gt_mask_2d.sum() + pred_binary.sum() - inter
+                iou = inter / (den + 1e-6)
+
+                # 'prd_scores' es por máscara; usa la media como "score" global del batch
+                score_loss = torch.abs(prd_scores.mean() - iou).mean()
+
+                # ---- pérdida total (con acumulación) ----
+                loss = (seg_loss + 0.05 * score_loss) / accumulation_steps
                 
                 # Backward pass
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(predictor.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)  # Only clip trainable params
                 
                 # Optimizer step
                 if step % accumulation_steps == 0:
                     scaler.step(optimizer)
                     scaler.update()
-                    predictor.model.zero_grad()
+                    optimizer.zero_grad()  # Use optimizer.zero_grad() instead of model.zero_grad()
                     scheduler.step()
                 
                 # Update running IoU
@@ -487,12 +514,10 @@ def train_sam2_model(model_size, learning_rate, weight_decay, steps, batch_size=
                             ckpt_files.sort(key=lambda x: float(x.split("iou")[1].split("_")[0]), reverse=True)
                             for old_ckpt in ckpt_files[3:]:
                                 os.remove(os.path.join(ckpt_dir, old_ckpt))
-                                print(f"  Removed old checkpoint: {old_ckpt}")
                     else:
                         # Check if improvement is below threshold
                         if val_iou <= best_val_iou - early_stopping_min_delta:
                             early_stopping_counter += 1
-                            print(f"  Early stopping counter: {early_stopping_counter}/{early_stopping_patience}")
                         else:
                             # Small improvement, reset counter
                             early_stopping_counter = 0
@@ -506,6 +531,11 @@ def train_sam2_model(model_size, learning_rate, weight_decay, steps, batch_size=
                     # Save latest checkpoint
                     latest_ckpt_path = os.path.join(ckpt_dir, f"latest_step{step}.torch")
                     torch.save(predictor.model.state_dict(), latest_ckpt_path)
+                    
+                    # PERIODIC SAFETY CHECKPOINT every 1000 steps
+                    if step % 1000 == 0:
+                        safe_ckpt = os.path.join(ckpt_dir, f"safe_step{step}.torch")
+                        torch.save(predictor.model.state_dict(), safe_ckpt)
                     
                     # Log metrics (consistent with TFM metrics)
                     logger.log(
@@ -540,7 +570,7 @@ def train_sam2_model(model_size, learning_rate, weight_decay, steps, batch_size=
         "early_stopping_patience": early_stopping_patience,
         "timestamp": timestamp,
         "checkpoint_dir": ckpt_dir,
-        "note": "Validation IoU and Dice now properly calculated with clamping to [0,1] range. Early stopping with patience=3."
+        "note": "IMPROVED: Parameter freezing, stable loss calculation, safety checkpoints, proper optimizer setup"
     }
     
     summary_path = os.path.join(ckpt_dir, "training_summary.json")
@@ -554,16 +584,15 @@ def train_sam2_model(model_size, learning_rate, weight_decay, steps, batch_size=
     print(f"Final training IoU: {mean_iou:.4f}")
     print(f"Checkpoints saved to: {ckpt_dir}")
     print(f"Training summary: {summary_path}")
-    print(f"Note: Validation metrics now include both IoU and Dice with proper [0,1] clamping")
-    print(f"Early stopping: patience={early_stopping_patience}, triggered={early_stopping_counter >= early_stopping_patience}")
+    print(f"Note: IMPROVED training with parameter freezing, stable loss, and safety checkpoints")
     
     return ckpt_dir
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train SAM2 Small and Large on full Severstal dataset")
-    parser.add_argument("--model_size", choices=["small", "large", "both"], default="both",
-                       help="Which model size to train")
+    parser.add_argument("--model_size", choices=["small", "large", "both"], default="small",
+                       help="Which model size to train (default: small)")
     parser.add_argument("--lr_small", type=float, default=1e-4,
                        help="Learning rate for small model")
     parser.add_argument("--lr_large", type=float, default=1e-4,
@@ -577,6 +606,9 @@ def main():
     
     args = parser.parse_args()
     
+    # SET SEED FOR REPRODUCIBILITY
+    set_seed(42)
+    
     print("SAM2 Full Dataset Training Script")
     print("=" * 50)
     print(f"Training {args.model_size} model(s) on Severstal dataset")
@@ -584,6 +616,7 @@ def main():
     print(f"Validation data: datasets/Data/splits/val_split")
     print(f"Training steps: {args.steps}")
     print(f"Effective batch size: {args.batch_size * 4}")
+    print(f"Checkpoints will be saved to: new_src/training/training_results/sam2_full_dataset/")
     
     results = {}
     

@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 """
-Evaluate LoRA SAM2 Large model on Severstal test split (2000 images).
+Evaluate SAM2 models with LoRA on Severstal test split (2000 images).
 
-This script evaluates LoRA-adapted SAM2 models trained with train_lora_sam2_full_dataset.py
-following the same evaluation pipeline and metrics as other models for TFM comparison.
+This script evaluates SAM2 models with LoRA adapters trained on different dataset sizes:
+- Supports evaluation of LoRA checkpoints from different training subsets (500, 1000, 2000, full)
+- Automatically finds best checkpoints from training results
+- Organizes visualizations by subset for easy comparison
+
+Supported evaluation modes:
+1. Auto-prompt: SAM2-AutoPrompt (no GT, no external detector) - for reference/experiment
+2. GT Points: SAM2 with 1-3 GT points (centroid + max distance + negative point)
+3. 30 GT Points: SAM2 with 30 GT points (for comparison with previous results)
 
 Test data: datasets/Data/splits/test_split (2000 images)
-Evaluation metrics: mIoU, IoU@50, IoU@75, IoU@90, IoU@95, Dice, Precision, Recall, F1
+Evaluation metrics: mIoU, IoU@50, IoU@75, IoU@90, IoU@95, Dice, Precision, Recall, F1, AUPRC
 Results saved in CSV format under data/results/ for comparative analysis.
+
+Usage examples:
+- Evaluate specific subset: --subset 500 --evaluation_mode gt_points
+- Evaluate all subsets: --subset all --evaluation_mode gt_points
+- Custom checkpoint: --lora_checkpoint /path/to/lora.torch --evaluation_mode gt_points
 
 """
 
@@ -33,15 +45,22 @@ from sklearn.metrics import average_precision_score
 import warnings
 warnings.filterwarnings('ignore')
 
-# Fix imports for sam2 module
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "libs", "sam2base"))
+# Add paths
+sys.path.append('/home/ptp/sam2/libs/sam2base')
+sys.path.append('/home/ptp/sam2/new_src/utils')  # To access metrics.py
+from metrics import SegmentationMetrics
 
-from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+from sam2.build_sam import build_sam2
 
-# Add src to path for utilities
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
-from utils import decode_bitmap_to_mask
+# Constants for hyperparameters (ensure consistency)
+POINT_BATCH_SIZE = 4
+BOX_BATCH_SIZE = 8
+GRID_SPACING = 128
+BOX_SCALES = [128, 256]
+CONFIDENCE_THRESHOLD = 0.7  # Less strict than 0.8
+NMS_IOU_THRESHOLD = 0.65   # Less strict than 0.8
+TOP_K_FILTER = 200
 
 def set_seed(seed=42):
     """Set seeds for reproducibility"""
@@ -50,6 +69,56 @@ def set_seed(seed=42):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def find_best_checkpoint_for_subset(subset, training_results_dir):
+    """
+    Find the best LoRA checkpoint for a given subset.
+    
+    Args:
+        subset: Dataset subset ("500", "1000", "2000", "full")
+        training_results_dir: Directory containing training results
+    
+    Returns:
+        best_checkpoint_path: Path to the best checkpoint, or None if not found
+    """
+    if not os.path.exists(training_results_dir):
+        print(f"Training results directory not found: {training_results_dir}")
+        return None
+    
+    # Look for directories matching the subset pattern
+    subset_dirs = []
+    for item in os.listdir(training_results_dir):
+        if os.path.isdir(os.path.join(training_results_dir, item)):
+            if f"_{subset}_" in item:
+                subset_dirs.append(item)
+    
+    if not subset_dirs:
+        print(f"No training results found for subset {subset}")
+        return None
+    
+    # Sort by timestamp (most recent first)
+    subset_dirs.sort(reverse=True)
+    latest_dir = subset_dirs[0]
+    
+    # Look for best LoRA checkpoint in this directory
+    checkpoint_dir = os.path.join(training_results_dir, latest_dir)
+    best_checkpoints = []
+    
+    for file in os.listdir(checkpoint_dir):
+        if file.startswith("best_lora_") and file.endswith(".torch"):
+            best_checkpoints.append(file)
+    
+    if not best_checkpoints:
+        print(f"No best LoRA checkpoints found in {checkpoint_dir}")
+        return None
+    
+    # Sort by IoU score (highest first)
+    best_checkpoints.sort(key=lambda x: float(x.split("iou")[1].split("_")[0]), reverse=True)
+    best_checkpoint = best_checkpoints[0]
+    
+    checkpoint_path = os.path.join(checkpoint_dir, best_checkpoint)
+    print(f"Found best checkpoint for subset {subset}: {checkpoint_path}")
+    return checkpoint_path
 
 class LoRALayer(torch.nn.Module):
     """LoRA layer implementation (same as training script)"""
@@ -143,32 +212,33 @@ def apply_lora_to_model(model, rank=8, alpha=16, dropout=0.05):
     
     return model, lora_params
 
-def load_lora_model(base_model_path, config_path, lora_checkpoint_path, device="cuda"):
-    """Load SAM2 model with LoRA adapters"""
-    print(f"Loading base SAM2 model: {base_model_path}")
+def load_backbone_with_optional_lora(backbone_ckpt, config_path, lora_ckpt=None, device="cuda"):
+    """Load backbone (base or fine-tuned) with optional LoRA adapters"""
+    print(f"Loading backbone: {backbone_ckpt}")
     
-    # Build base model using relative config name (Hydra expects this format)
+    # Build backbone (base or FT, doesn't matter the origin)
     config_name = os.path.basename(config_path).replace('.yaml', '')
-    sam2_model = build_sam2(config_name, base_model_path, device=device)
+    sam2_model = build_sam2(config_name, backbone_ckpt, device=device)
+    
+    # If there's LoRA, wrap projections and load adapters
+    if lora_ckpt is not None:
+        print("Applying LoRA structure...")
+        sam2_model, _ = apply_lora_to_model(sam2_model, rank=8, alpha=16, dropout=0.05)
+        
+        print(f"Loading LoRA checkpoint: {lora_ckpt}")
+        sd = torch.load(lora_ckpt, map_location=device)
+        missing_keys, unexpected_keys = sam2_model.load_state_dict(sd, strict=False)
+        
+        if missing_keys:
+            print(f"Missing keys (expected for base model): {len(missing_keys)}")
+        if unexpected_keys:
+            print(f"Unexpected keys: {unexpected_keys}")
+        
+        print(f"Backbone + LoRA model loaded successfully")
+    else:
+        print(f"Backbone model loaded successfully (no LoRA)")
+    
     predictor = SAM2ImagePredictor(sam2_model)
-    
-    # Apply LoRA structure (this creates the LoRA layers)
-    print("Applying LoRA structure...")
-    sam2_model, lora_params = apply_lora_to_model(sam2_model)
-    
-    # Load LoRA checkpoint
-    print(f"Loading LoRA checkpoint: {lora_checkpoint_path}")
-    lora_state_dict = torch.load(lora_checkpoint_path, map_location=device)
-    
-    # Load LoRA parameters
-    missing_keys, unexpected_keys = sam2_model.load_state_dict(lora_state_dict, strict=False)
-    
-    if missing_keys:
-        print(f"Missing keys (expected for base model): {len(missing_keys)}")
-    if unexpected_keys:
-        print(f"Unexpected keys: {unexpected_keys}")
-    
-    print(f"LoRA model loaded successfully")
     return predictor
 
 def get_binary_gt_mask(ann_path, target_shape):
@@ -178,91 +248,320 @@ def get_binary_gt_mask(ann_path, target_shape):
             data = json.load(f)
         
         if 'objects' not in data or not data['objects']:
-            return np.zeros(target_shape, dtype=np.uint8)
+            return None
         
         # Get image dimensions
         height = data['size']['height']
         width = data['size']['width']
         
         # Create empty mask
-        full_mask = np.zeros((height, width), dtype=np.uint8)
+        full_mask = np.zeros((height, width), dtype=bool)
         
-        # Process all objects with proper bitmap positioning
+        # Process all objects (not just the first one)
         for obj in data['objects']:
             if 'bitmap' not in obj or 'data' not in obj['bitmap']:
                 continue
             
-            bmp = obj['bitmap']
-            
             # Decompress bitmap data (PNG compressed)
-            compressed_data = base64.b64decode(bmp['data'])
+            compressed_data = base64.b64decode(obj['bitmap']['data'])
             decompressed_data = zlib.decompress(compressed_data)
             
             # Load PNG image from bytes
             png_image = Image.open(io.BytesIO(decompressed_data))
-            
-            # Use ALPHA channel if exists, otherwise convert to L (grayscale)
-            if png_image.mode == 'RGBA':
-                crop = np.array(png_image.split()[-1])  # Alpha channel
-            else:
-                crop = np.array(png_image.convert('L'))  # Grayscale
+            mask = np.array(png_image)
             
             # Convert to binary mask
-            crop_bin = (crop > 0).astype(np.uint8)
+            binary_mask = mask > 0
             
-            # Get origin coordinates from bitmap
-            x0, y0 = bmp.get('origin', [0, 0])
-            h, w = crop_bin.shape[:2]
+            # Resize to full image size
+            mask_pil = Image.fromarray(binary_mask.astype(np.uint8) * 255)
+            mask_pil = mask_pil.resize((width, height), Image.NEAREST)
+            obj_mask = np.array(mask_pil) > 0
             
-            # Calculate end coordinates (clamped to image boundaries)
-            x1, y1 = min(x0 + w, width), min(y0 + h, height)
-            
-            # Place the bitmap at the correct position
-            if x1 > x0 and y1 > y0:
-                full_mask[y0:y1, x0:x1] = np.maximum(
-                    full_mask[y0:y1, x0:x1],
-                    crop_bin[:y1-y0, :x1-x0]
-                )
+            # Combine with full mask
+            full_mask = np.logical_or(full_mask, obj_mask)
         
         # Resize to target shape if needed
         if full_mask.shape != target_shape:
-            mask_pil = Image.fromarray(full_mask * 255)
+            mask_pil = Image.fromarray(full_mask.astype(np.uint8) * 255)
             mask_pil = mask_pil.resize((target_shape[1], target_shape[0]), Image.NEAREST)
-            full_mask = (np.array(mask_pil) > 0).astype(np.uint8)
+            full_mask = np.array(mask_pil) > 0
         
         return full_mask
         
     except Exception as e:
         print(f"Error loading GT from {ann_path}: {e}")
-        return np.zeros(target_shape, dtype=np.uint8)
+        return None
 
-def generate_point_prompts(binary_mask, num_points=10):
-    """Generate point prompts from binary mask (same as training)"""
-    # Erode mask to get interior points
-    eroded = cv2.erode(binary_mask, np.ones((5, 5), np.uint8), iterations=1)
+def generate_auto_prompts(image, grid_spacing=GRID_SPACING, box_scales=BOX_SCALES):
+    """Generate automatic prompts from image without GT information (controlled complexity)"""
+    height, width = image.shape[:2]
     
-    # Find coordinates of positive pixels
-    coords = np.argwhere(eroded > 0)
+    # Strategy 1: Grid-based point sampling (limited density)
+    grid_points = []
+    grid_labels = []
     
-    if len(coords) == 0:
-        # Fallback to original mask if erosion removes everything
-        coords = np.argwhere(binary_mask > 0)
+    # Sample points in a regular grid with controlled spacing
+    for y in range(grid_spacing, height - grid_spacing, grid_spacing):
+        for x in range(grid_spacing, width - grid_spacing, grid_spacing):
+            grid_points.append([x, y])
+            grid_labels.append(1)  # All points are positive prompts
     
-    if len(coords) == 0:
-        return np.zeros((0, 1, 2)), np.zeros((0, 1))
+    # Strategy 2: Multi-scale box sweeping (limited scales and density)
+    auto_boxes = []
+    for scale in box_scales:
+        stride = scale  # Full scale stride to reduce density
+        for y in range(0, height - scale, stride):
+            for x in range(0, width - scale, stride):
+                # Ensure box is within image boundaries
+                if x + scale <= width and y + scale <= height:
+                    auto_boxes.append([x, y, x + scale, y + scale])
     
-    # Shuffle and select up to num_points
-    np.random.shuffle(coords)
-    points = coords[:min(num_points, len(coords))]
+    return {
+        'points': np.array(grid_points) if grid_points else np.zeros((0, 2)),
+        'point_labels': np.array(grid_labels) if grid_labels else np.zeros((0,)),
+        'boxes': np.array(auto_boxes) if auto_boxes else np.zeros((0, 4))
+    }
+
+def generate_gt_points(gt_mask, num_points=3):
+    """Generate GT points from ground truth mask (centroid + max distance + negative point)"""
+    from scipy.ndimage import label, distance_transform_edt
+    if gt_mask is None or gt_mask.sum() == 0:
+        return np.zeros((0,2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+
+    labeled, n = label(gt_mask)
+    if n == 0:
+        return np.zeros((0,2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+
+    # componente principal
+    sizes = [np.sum(labeled == i) for i in range(1, n+1)]
+    comp = np.argmax(sizes) + 1
+    main = (labeled == comp).astype(np.uint8)
+
+    pts, lbs = [], []
+
+    # 1) centroide
+    ys, xs = np.where(main)
+    cx, cy = int(np.mean(xs)), int(np.mean(ys))
+    pts.append([cx, cy]); lbs.append(1)
+
+    # 2) punto más interior
+    if num_points >= 2:
+        dist = distance_transform_edt(main)
+        my, mx = np.unravel_index(np.argmax(dist), dist.shape)
+        if abs(mx-cx) > 3 or abs(my-cy) > 3:
+            pts.append([mx, my]); lbs.append(1)
+
+    # 3) punto negativo fuera del borde
+    if num_points >= 3:
+        k = np.ones((3,3), np.uint8)
+        outer = cv2.dilate(main, k, iterations=6)  # 5–10 px aprox
+        neg_candidates = np.where((outer > 0) & (main == 0))
+        if len(neg_candidates[0]) > 0:
+            i = np.random.randint(len(neg_candidates[0]))
+            ny, nx = int(neg_candidates[0][i]), int(neg_candidates[1][i])
+            pts.append([nx, ny]); lbs.append(0)
+
+    return np.array(pts, dtype=np.float32), np.array(lbs, dtype=np.int32)
+
+def generate_30_gt_points(gt_mask):
+    """Generate 30 GT points from ground truth mask (for comparison with previous results)"""
+    if gt_mask is None or gt_mask.sum() == 0:
+        return np.zeros((0, 2)), np.zeros((0,))
     
-    # Convert to SAM2 format: (y, x) -> (x, y) and add batch dimension
-    points = points[:, [1, 0]]  # Swap x, y
-    points = np.expand_dims(points, axis=1)  # Add batch dimension
+    # Find connected components
+    from scipy.ndimage import label
+    labeled_mask, num_components = label(gt_mask)
     
-    # Create labels (all positive)
-    labels = np.ones((len(points), 1), dtype=np.int32)
+    if num_components == 0:
+        return np.zeros((0, 2)), np.zeros((0,))
     
-    return points, labels
+    # Get the largest component
+    component_sizes = []
+    for i in range(1, num_components + 1):
+        component_sizes.append((labeled_mask == i).sum())
+    
+    largest_component_idx = np.argmax(component_sizes) + 1
+    main_mask = (labeled_mask == largest_component_idx)
+    
+    # Sample 30 points from the mask
+    y_coords, x_coords = np.where(main_mask)
+    
+    if len(y_coords) < 30:
+        # If mask is smaller than 30 pixels, repeat some points
+        points = []
+        labels = []
+        for i in range(30):
+            idx = i % len(y_coords)
+            points.append([x_coords[idx], y_coords[idx]])
+            labels.append(1)
+        return np.array(points), np.array(labels)
+    
+    # Randomly sample 30 points
+    indices = np.random.choice(len(y_coords), 30, replace=False)
+    points = []
+    labels = []
+    
+    for idx in indices:
+        points.append([x_coords[idx], y_coords[idx]])
+        labels.append(1)  # All positive points
+    
+    return np.array(points), np.array(labels)
+
+def compute_mask_iou(mask1, mask2):
+    """Compute IoU between two binary masks"""
+    intersection = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+    return intersection / (union + 1e-8)
+
+def apply_nms(masks, scores, iou_threshold=NMS_IOU_THRESHOLD):
+    """Apply Non-Maximum Suppression to remove overlapping masks"""
+    if len(masks) <= 1:
+        return masks, scores
+    
+    # Sort by score (descending)
+    sorted_indices = np.argsort(scores)[::-1]
+    keep_indices = []
+    
+    for idx in sorted_indices:
+        keep = True
+        for kept_idx in keep_indices:
+            iou = compute_mask_iou(masks[idx], masks[kept_idx])
+            if iou > iou_threshold:
+                keep = False
+                break
+        
+        if keep:
+            keep_indices.append(idx)
+    
+    return [masks[i] for i in keep_indices], [scores[i] for i in keep_indices]
+
+def predict_with_auto_prompts(predictor, image, auto_prompts, confidence_threshold=CONFIDENCE_THRESHOLD, 
+                             point_batch_size=POINT_BATCH_SIZE, box_batch_size=BOX_BATCH_SIZE):
+    """Predict using automatic prompts with proper individual processing and NMS"""
+    height, width = image.shape[:2]
+    
+    all_masks = []
+    all_scores = []
+    
+    # Predict with grid points in very small batches (1-4 points per call)
+    if len(auto_prompts['points']) > 0:
+        try:
+            points = auto_prompts['points']
+            labels = auto_prompts['point_labels']
+            
+            # Process points in very small batches to avoid semantic mixing
+            for i in range(0, len(points), point_batch_size):
+                batch_points = points[i:i + point_batch_size]
+                batch_labels = labels[i:i + point_batch_size]
+                
+                point_masks, point_scores, _ = predictor.predict(
+                    point_coords=batch_points,
+                    point_labels=batch_labels,
+                    multimask_output=True
+                )
+                
+                # Each batch call returns masks for the entire batch
+                # We need to handle this correctly
+                if len(batch_points) == 1:
+                    # Single point: process normally
+                    for j, score in enumerate(point_scores):
+                        if score > confidence_threshold:
+                            # Ensure binary mask
+                            mask = (point_masks[j].astype(np.float32) > 0.5).astype(bool)
+                            all_masks.append(mask)
+                            all_scores.append(score)
+                else:
+                    # Multiple points: each mask corresponds to the entire batch
+                    # We need to split them properly - this is complex with SAM2
+                    # For now, treat as single prediction and use best score
+                    best_idx = np.argmax(point_scores)
+                    if point_scores[best_idx] > confidence_threshold:
+                        mask = (point_masks[best_idx].astype(np.float32) > 0.5).astype(bool)
+                        all_masks.append(mask)
+                        all_scores.append(point_scores[best_idx])
+                        
+        except Exception as e:
+            print(f"Error with point prompts: {e}")
+    
+    # Predict with auto boxes individually (one per call)
+    if len(auto_prompts['boxes']) > 0:
+        try:
+            boxes = auto_prompts['boxes']
+            
+            # Process boxes individually to avoid semantic mixing
+            for box in boxes:
+                box_masks, box_scores, _ = predictor.predict(
+                    box=box,
+                    multimask_output=True
+                )
+                
+                # Filter by confidence and add to collection
+                for j, score in enumerate(box_scores):
+                    if score > confidence_threshold:
+                        # Ensure binary mask
+                        mask = (box_masks[j].astype(np.float32) > 0.5).astype(bool)
+                        all_masks.append(mask)
+                        all_scores.append(score)
+                        
+        except Exception as e:
+            print(f"Error with box prompts: {e}")
+    
+    if not all_masks:
+        return np.zeros((height, width), dtype=bool), 0
+    
+    # Apply top-K filtering before NMS to control memory
+    original_candidates = len(all_masks)
+    if len(all_masks) > TOP_K_FILTER:
+        # Sort by score and keep top K
+        sorted_indices = np.argsort(all_scores)[::-1][:TOP_K_FILTER]
+        all_masks = [all_masks[i] for i in sorted_indices]
+        all_scores = [all_scores[i] for i in sorted_indices]
+        print(f"Applied top-{TOP_K_FILTER} filtering: kept {len(all_masks)} masks from {original_candidates} candidates")
+    
+    # Apply NMS to remove overlapping masks
+    filtered_masks, filtered_scores = apply_nms(all_masks, all_scores)
+    
+    if not filtered_masks:
+        return np.zeros((height, width), dtype=bool), 0
+    
+    # Combine masks using logical OR (more robust than averaging)
+    combined_mask = np.zeros((height, width), dtype=bool)
+    for mask in filtered_masks:
+        # Ensure binary before OR operation
+        binary_mask = mask.astype(bool)
+        combined_mask = np.logical_or(combined_mask, binary_mask)
+    
+    return combined_mask, len(filtered_masks)
+
+def predict_with_gt_points(predictor, image, gt_points, gt_labels, confidence_threshold=CONFIDENCE_THRESHOLD):
+    """Predict using GT points (1-3 or 30 points)"""
+    height, width = image.shape[:2]
+    
+    if len(gt_points) == 0:
+        return np.zeros((height, width), dtype=bool), 0
+    
+    try:
+        # For GT points, we can use all points at once since they're well-distributed
+        point_masks, point_scores, _ = predictor.predict(
+            point_coords=gt_points,
+            point_labels=gt_labels,
+            multimask_output=True
+        )
+        
+        # Select the best mask based on score
+        best_idx = np.argmax(point_scores)
+        best_score = point_scores[best_idx]
+        
+        if best_score > confidence_threshold:
+            pred_mask = (point_masks[best_idx].astype(np.float32) > 0.5).astype(bool)
+            return pred_mask, 1
+        else:
+            return np.zeros((height, width), dtype=bool), 0
+            
+    except Exception as e:
+        print(f"Error with GT point prompts: {e}")
+        return np.zeros((height, width), dtype=bool), 0
 
 def load_image_and_mask(img_path, ann_path):
     """Load image and corresponding binary mask (same preprocessing as training)"""
@@ -335,8 +634,9 @@ def calculate_iou_at_thresholds(pred_prob, gt_mask, thresholds=[0.5, 0.75, 0.9, 
     
     return results
 
-def evaluate_lora_sam2(predictor, test_data, threshold=0.5, save_examples=False, output_dir=None):
-    """Evaluate LoRA SAM2 model on test data"""
+def evaluate_lora_sam2(predictor, test_data, threshold=0.5, save_examples=False, output_dir=None, 
+                      evaluation_mode="auto_prompt", num_gt_points=3, subset="unknown"):
+    """Evaluate LoRA SAM2 model on test data using different evaluation modes"""
     predictor.model.eval()
     
     all_metrics = []
@@ -349,7 +649,15 @@ def evaluate_lora_sam2(predictor, test_data, threshold=0.5, save_examples=False,
     sample_preds = []
     sample_targets = []
     
-    print(f"Evaluating LoRA SAM2 on {len(test_data)} test images...")
+    print(f"Evaluating LoRA SAM2 (subset {subset}) on {len(test_data)} test images...")
+    
+    # Set evaluation mode description
+    if evaluation_mode == "auto_prompt":
+        print(f"Evaluation mode: SAM2-AutoPrompt (no GT, no external detector)")
+    elif evaluation_mode == "gt_points":
+        print(f"Evaluation mode: SAM2 with {num_gt_points} GT points (centroid + max distance + negative)")
+    elif evaluation_mode == "30_gt_points":
+        print(f"Evaluation mode: SAM2 with 30 GT points (for comparison with previous results)")
     
     with torch.no_grad():
         for idx, (img_path, ann_path) in enumerate(tqdm(test_data, desc="Evaluating")):
@@ -357,68 +665,48 @@ def evaluate_lora_sam2(predictor, test_data, threshold=0.5, save_examples=False,
                 # Load image and mask
                 image, mask = load_image_and_mask(img_path, ann_path)
                 
-                # Generate point prompts from ground truth mask
-                input_points, input_labels = generate_point_prompts(mask)
-                
-                if len(input_points) == 0:
-                    # Skip images without valid prompts
-                    continue
+                # Generate prompts based on evaluation mode
+                if evaluation_mode == "auto_prompt":
+                    # Generate automatic prompts from image (no GT)
+                    auto_prompts = generate_auto_prompts(image)
+                    gt_points, gt_labels = None, None
+                elif evaluation_mode == "gt_points":
+                    # Generate 1-3 GT points
+                    gt_points, gt_labels = generate_gt_points(mask, num_gt_points)
+                    auto_prompts = None
+                elif evaluation_mode == "30_gt_points":
+                    # Generate 30 GT points
+                    gt_points, gt_labels = generate_30_gt_points(mask)
+                    auto_prompts = None
                 
                 # Measure inference time
                 start_time = time.time()
                 
-                # Set image and predict
+                # Set image and predict based on mode
                 predictor.set_image(image)
                 
-                # Prepare prompts (same as training)
-                input_point_tensor = torch.tensor(input_points, dtype=torch.float32).cuda()
-                input_label_tensor = torch.tensor(input_labels, dtype=torch.int64).cuda()
-                
-                mask_input, unnorm_coords, labels, _ = predictor._prep_prompts(
-                    input_point_tensor, input_label_tensor, box=None, mask_logits=None, normalize_coords=True
-                )
-                
-                if unnorm_coords is None or labels is None:
-                    continue
-                
-                # Get embeddings and predict
-                sparse_embeddings, dense_embeddings = predictor.model.sam_prompt_encoder(
-                    points=(unnorm_coords, labels), boxes=None, masks=None
-                )
-                
-                batched_mode = unnorm_coords.shape[0] > 1
-                high_res_features = [feat[-1].unsqueeze(0) for feat in predictor._features["high_res_feats"]]
-                low_res_masks, prd_scores, _, _ = predictor.model.sam_mask_decoder(
-                    image_embeddings=predictor._features["image_embed"][-1].unsqueeze(0),
-                    image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,
-                    multimask_output=True,
-                    repeat_image=batched_mode,
-                    high_res_features=high_res_features,
-                )
+                # Predict based on evaluation mode
+                if evaluation_mode == "auto_prompt":
+                    pred_mask, num_masks = predict_with_auto_prompts(predictor, image, auto_prompts)
+                else:
+                    pred_mask, num_masks = predict_with_gt_points(predictor, image, gt_points, gt_labels)
                 
                 inference_time = time.time() - start_time
                 inference_times.append(inference_time)
                 
-                # Post-process masks
-                prd_masks = predictor._transforms.postprocess_masks(low_res_masks, predictor._orig_hw[-1])
+                # Convert to probability map if needed
+                if pred_mask.dtype == bool:
+                    pred_prob = pred_mask.astype(np.float32)
+                else:
+                    pred_prob = pred_mask.astype(np.float32)
                 
-                # Get probability map (use sigmoid)
-                prd_prob = torch.sigmoid(prd_masks[:, 0])
-                
-                # Combine multi-instance predictions if needed
-                if prd_prob.dim() == 3:
-                    prd_prob = prd_prob.max(dim=0).values
-                
-                # Convert to numpy and resize to match ground truth
-                pred_prob_np = prd_prob.cpu().numpy()
-                if pred_prob_np.shape != mask.shape:
-                    pred_prob_np = cv2.resize(pred_prob_np, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
+                # Ensure prediction matches ground truth size
+                if pred_prob.shape != mask.shape:
+                    pred_prob = cv2.resize(pred_prob, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
                 
                 # Calculate metrics
-                metrics = calculate_metrics(pred_prob_np, mask)
-                iou_thresholds = calculate_iou_at_thresholds(pred_prob_np, mask)
+                metrics = calculate_metrics(pred_prob, mask)
+                iou_thresholds = calculate_iou_at_thresholds(pred_prob, mask)
                 
                 # Combine all metrics
                 combined_metrics = {**metrics, **iou_thresholds}
@@ -427,12 +715,12 @@ def evaluate_lora_sam2(predictor, test_data, threshold=0.5, save_examples=False,
                 
                 # Store sample for AUPRC
                 if idx in sample_indices:
-                    sample_preds.append(pred_prob_np.flatten())
+                    sample_preds.append(pred_prob.flatten())
                     sample_targets.append(mask.flatten())
                 
                 # Save examples if requested
                 if save_examples and output_dir and idx < 20:
-                    save_prediction_example(pred_prob_np, mask, img_path, output_dir, idx)
+                    save_prediction_example(pred_prob, mask, img_path, output_dir, idx, subset)
                 
             except Exception as e:
                 print(f"Error processing {img_path}: {e}")
@@ -461,9 +749,11 @@ def evaluate_lora_sam2(predictor, test_data, threshold=0.5, save_examples=False,
     else:
         return None, []
 
-def save_prediction_example(pred, target, img_path, output_dir, idx):
-    """Save prediction example for visualization"""
-    os.makedirs(output_dir, exist_ok=True)
+def save_prediction_example(pred, target, img_path, output_dir, idx, subset="unknown"):
+    """Save prediction example for visualization with subset organization"""
+    # Create subset-specific subdirectory
+    subset_dir = os.path.join(output_dir, f"subset_{subset}")
+    os.makedirs(subset_dir, exist_ok=True)
     
     # Create figure with 3 subplots
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -488,26 +778,56 @@ def save_prediction_example(pred, target, img_path, output_dir, idx):
     axes[2].set_title('Prediction')
     axes[2].axis('off')
     
-    # Save
-    filename = f"lora_sam2_pred_{idx:04d}.png"
-    plt.savefig(os.path.join(output_dir, filename), dpi=150, bbox_inches='tight')
+    # Add main title
+    fig.suptitle(f'SAM2 + LoRA - Subset {subset}', fontsize=16, fontweight='bold')
+    
+    # Get original image name for filename
+    original_name = os.path.splitext(os.path.basename(img_path))[0]
+    filename = f"{original_name}_viz_subset{subset}.png"
+    
+    plt.savefig(os.path.join(subset_dir, filename), dpi=150, bbox_inches='tight')
     plt.close()
 
-def save_results_csv(results, model_info, output_dir="new_src/evaluation/evaluation_results/sam2_lora"):
+def save_results_csv(results, model_info, output_dir="new_src/evaluation/evaluation_results/sam2_lora", 
+                    evaluation_mode="auto_prompt", num_gt_points=3):
     """Save evaluation results to CSV following TFM format"""
     os.makedirs(output_dir, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
-    filename = f"exp_lora_sam2_{model_info['lr']}_{timestamp}.csv"
+    
+    # Prepare prompt type based on evaluation mode
+    if evaluation_mode == "auto_prompt":
+        prompt_type = "sam2_autoprompt"
+    elif evaluation_mode == "gt_points":
+        prompt_type = f"gt_points_{num_gt_points}"
+    elif evaluation_mode == "30_gt_points":
+        prompt_type = "gt_points_30"
+    
+    # Prepare model name and variant based on model label
+    model_label = model_info['model_label']
+    if model_label == 'SAM2-Base':
+        variant = "base_original_meta"
+        exp_prefix = "exp_base_sam2"
+    elif model_label == 'SAM2-FT':
+        variant = "fine_tuned_no_lora"
+        exp_prefix = "exp_ft_sam2"
+    elif model_label == 'SAM2-Base+LoRA':
+        variant = f"base_lora_r{model_info['rank']}_a{model_info['alpha']}_lr{model_info['lr']}"
+        exp_prefix = "exp_base_lora_sam2"
+    elif model_label == 'SAM2-FT+LoRA':
+        variant = f"ft_lora_r{model_info['rank']}_a{model_info['alpha']}_lr{model_info['lr']}"
+        exp_prefix = "exp_ft_lora_sam2"
+    
+    filename = f"{exp_prefix}_{prompt_type}_{timestamp}.csv"
     filepath = os.path.join(output_dir, filename)
     
     # Prepare data for CSV
     data = {
-        'exp_id': f"exp_lora_sam2_{model_info['lr']}_{timestamp}",
-        'model': 'SAM2-Large-LoRA',
+        'exp_id': f"{exp_prefix}_{prompt_type}_{timestamp}",
+        'model': model_label,
         'subset_size': 'full_dataset',
-        'variant': f"lora_r{model_info['rank']}_a{model_info['alpha']}_lr{model_info['lr']}",
-        'prompt_type': 'points',
+        'variant': variant,
+        'prompt_type': prompt_type,
         'img_size': '1024xAuto',
         'batch_size': 1,
         'steps': model_info.get('steps', 'N/A'),
@@ -527,7 +847,8 @@ def save_results_csv(results, model_info, output_dir="new_src/evaluation/evaluat
         'F1': results['f1'],
         'AUPRC': results.get('auprc', 'N/A'),
         'avg_inference_time': results.get('avg_inference_time', 'N/A'),
-        'ckpt_path': model_info['checkpoint_path'],
+        'backbone_ckpt': model_info['backbone_ckpt'],
+        'lora_ckpt': model_info['lora_ckpt'],
         'timestamp': timestamp
     }
     
@@ -539,17 +860,26 @@ def save_results_csv(results, model_info, output_dir="new_src/evaluation/evaluat
     return filepath
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate LoRA SAM2 Large on Severstal test split')
+    parser = argparse.ArgumentParser(description='Evaluate SAM2 with LoRA on Severstal test split')
     
     # Model configuration
-    parser.add_argument('--lora_checkpoint', type=str, required=True,
-                       help='Path to LoRA checkpoint file')
-    parser.add_argument('--base_model', type=str, 
-                       default='models/sam2_base_models/sam2_hiera_large.pt',
-                       help='Path to base SAM2 model')
+    parser.add_argument('--backbone_ckpt', type=str, 
+                       default='models/base/sam2/sam2_hiera_large.pt',
+                       help='Path to backbone checkpoint (Meta .pt or fine-tuned .torch)')
     parser.add_argument('--config', type=str,
-                       default='configs/sam2/sam2_hiera_l.yaml',
-                       help='Path to SAM2 config file')
+                       default='sam2_hiera_l',
+                       help='SAM2 config name')
+    parser.add_argument('--lora_checkpoint', type=str, default=None,
+                       help='Path to LoRA checkpoint (optional, overrides subset selection)')
+    
+    # Subset evaluation
+    parser.add_argument('--subset', type=str, 
+                       choices=['500', '1000', '2000', 'full', 'all'],
+                       default='all',
+                       help='Dataset subset to evaluate: 500, 1000, 2000, full, or all')
+    parser.add_argument('--training_results_dir', type=str,
+                       default='new_src/training/training_results/sam2_lora',
+                       help='Directory containing training results')
     
     # Data paths
     parser.add_argument('--test_dir', type=str,
@@ -563,6 +893,12 @@ def main():
                        help='Save prediction examples')
     parser.add_argument('--output_dir', type=str, default='new_src/evaluation/evaluation_results/sam2_lora',
                        help='Output directory for results')
+    parser.add_argument('--evaluation_mode', type=str, 
+                       choices=['auto_prompt', 'gt_points', '30_gt_points'],
+                       default='gt_points',
+                       help='Evaluation mode: auto_prompt (no GT), gt_points (1-3 GT points), or 30_gt_points (30 GT points)')
+    parser.add_argument('--num_gt_points', type=int, default=3,
+                       help='Number of GT points to use when evaluation_mode is gt_points (1-3)')
     
     # System settings
     parser.add_argument('--device', type=str, default='cuda:0',
@@ -574,6 +910,11 @@ def main():
     
     args = parser.parse_args()
     
+    # Validate arguments
+    if args.evaluation_mode == 'gt_points' and (args.num_gt_points < 1 or args.num_gt_points > 3):
+        print("Error: num_gt_points must be between 1 and 3 when evaluation_mode is gt_points")
+        sys.exit(1)
+    
     # Set seed
     set_seed(args.seed)
     
@@ -581,13 +922,16 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    print("LoRA SAM2 Large Evaluation Script")
+    print(f"SAM2 LoRA Evaluation Script")
     print("=" * 50)
-    print(f"LoRA checkpoint: {args.lora_checkpoint}")
-    print(f"Base model: {args.base_model}")
+    print(f"Backbone checkpoint: {args.backbone_ckpt}")
     print(f"Config: {args.config}")
     print(f"Test data: {args.test_dir}")
+    print(f"Evaluation mode: {args.evaluation_mode}")
+    if args.evaluation_mode == "gt_points":
+        print(f"Number of GT points: {args.num_gt_points}")
     print(f"Threshold: {args.threshold}")
+    print(f"Subset evaluation: {args.subset}")
     print("-" * 50)
     
     # Get project root directory (go up from new_src/evaluation/)
@@ -595,22 +939,20 @@ def main():
     project_root = os.path.dirname(os.path.dirname(script_dir))
     
     # Convert relative paths to absolute paths from project root
-    if not os.path.isabs(args.base_model):
-        args.base_model = os.path.join(project_root, args.base_model)
-    if not os.path.isabs(args.config):
-        args.config = os.path.join(project_root, args.config)
+    if not os.path.isabs(args.backbone_ckpt):
+        args.backbone_ckpt = os.path.join(project_root, args.backbone_ckpt)
     if not os.path.isabs(args.test_dir):
         args.test_dir = os.path.join(project_root, args.test_dir)
     if not os.path.isabs(args.output_dir):
         args.output_dir = os.path.join(project_root, args.output_dir)
+    if not os.path.isabs(args.training_results_dir):
+        args.training_results_dir = os.path.join(project_root, args.training_results_dir)
+    if args.lora_checkpoint and not os.path.isabs(args.lora_checkpoint):
+        args.lora_checkpoint = os.path.join(project_root, args.lora_checkpoint)
     
     # Check if files exist
-    if not os.path.exists(args.lora_checkpoint):
-        raise ValueError(f"LoRA checkpoint not found: {args.lora_checkpoint}")
-    if not os.path.exists(args.base_model):
-        raise ValueError(f"Base model not found: {args.base_model}")
-    if not os.path.exists(args.config):
-        raise ValueError(f"Config file not found: {args.config}")
+    if not os.path.exists(args.backbone_ckpt):
+        raise ValueError(f"Backbone checkpoint not found: {args.backbone_ckpt}")
     
     # Load test data
     print("Loading test data...")
@@ -647,102 +989,161 @@ def main():
     if len(test_data) == 0:
         raise ValueError("No valid test data found")
     
-    # Load LoRA model
-    print("Loading LoRA SAM2 model...")
-    predictor = load_lora_model(args.base_model, args.config, args.lora_checkpoint, device)
-    
-    # Extract model info from checkpoint path for CSV
-    checkpoint_name = os.path.basename(args.lora_checkpoint)
-    model_info = {
-        'checkpoint_path': args.lora_checkpoint,
-        'rank': 8,  # Default values, could be extracted from checkpoint
-        'alpha': 16,
-        'lr': 'unknown',  # Could be extracted from checkpoint directory name
-        'steps': 'unknown',
-        'weight_decay': 'unknown'
-    }
-    
-    # Try to extract info from checkpoint path
-    if 'r8' in checkpoint_name or 'r16' in checkpoint_name:
-        if 'r8' in checkpoint_name:
-            model_info['rank'] = 8
-        elif 'r16' in checkpoint_name:
-            model_info['rank'] = 16
-    
-    if 'lr' in checkpoint_name:
-        # Extract learning rate from filename
-        import re
-        lr_match = re.search(r'lr([0-9e\-\.]+)', checkpoint_name)
-        if lr_match:
-            model_info['lr'] = lr_match.group(1)
-    
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Evaluate model
-    print(f"\nEvaluating LoRA SAM2 Large...")
-    results, detailed_results = evaluate_lora_sam2(
-        predictor=predictor,
-        test_data=test_data,
-        threshold=args.threshold,
-        save_examples=args.save_examples,
-        output_dir=args.output_dir if args.save_examples else None
-    )
+    # Determine which subsets to evaluate
+    if args.subset == 'all':
+        subsets_to_evaluate = ['500', '1000', '2000', 'full']
+    else:
+        subsets_to_evaluate = [args.subset]
     
-    if results is None:
-        print("Evaluation failed!")
-        return
+    # Evaluate each subset
+    all_results = {}
     
-    # Print results
-    print(f"\nEvaluation Results for LoRA SAM2 Large:")
-    print("=" * 50)
-    print(f"Basic Metrics (threshold={args.threshold}):")
-    print(f"  mIoU: {results['iou']:.4f}")
-    print(f"  mDice: {results['dice']:.4f}")
-    print(f"  Precision: {results['precision']:.4f}")
-    print(f"  Recall: {results['recall']:.4f}")
-    print(f"  F1: {results['f1']:.4f}")
-    
-    print(f"\nIoU at Different Thresholds:")
-    if 'iou_50' in results:
-        print(f"  IoU@50: {results['iou_50']:.4f}")
-    if 'iou_75' in results:
-        print(f"  IoU@75: {results['iou_75']:.4f}")
-    if 'iou_90' in results:
-        print(f"  IoU@90: {results['iou_90']:.4f}")
-    if 'iou_95' in results:
-        print(f"  IoU@95: {results['iou_95']:.4f}")
-    
-    print(f"\nExtra Metrics:")
-    if 'auprc' in results:
-        print(f"  AUPRC: {results['auprc']:.4f}")
-    
-    print(f"\nPerformance:")
-    if 'avg_inference_time' in results:
-        print(f"  Average inference time: {results['avg_inference_time']:.4f}s")
-    if 'total_inference_time' in results:
-        print(f"  Total inference time: {results['total_inference_time']:.2f}s")
-    
-    # Save results to CSV
-            csv_path = save_results_csv(results, model_info, "new_src/evaluation/evaluation_results/sam2_lora")
-    
-    # Save detailed results as JSON
-    json_path = os.path.join(args.output_dir, f"detailed_results_lora_sam2.json")
-    results_json = {}
-    for key, value in results.items():
-        if isinstance(value, np.ndarray):
-            results_json[key] = value.tolist()
+    for subset in subsets_to_evaluate:
+        print(f"\n{'='*60}")
+        print(f"Evaluating subset: {subset}")
+        print(f"{'='*60}")
+        
+        # Find best checkpoint for this subset
+        if args.lora_checkpoint:
+            lora_checkpoint = args.lora_checkpoint
+            print(f"Using custom LoRA checkpoint: {lora_checkpoint}")
         else:
-            results_json[key] = value
+            lora_checkpoint = find_best_checkpoint_for_subset(subset, args.training_results_dir)
+            if lora_checkpoint is None:
+                print(f"No checkpoint found for subset {subset}, skipping...")
+                continue
+        
+        # Load model with LoRA
+        predictor = load_backbone_with_optional_lora(
+            backbone_ckpt=args.backbone_ckpt,
+            config_path=args.config,
+            lora_ckpt=lora_checkpoint,
+            device=device
+        )
+        
+        # Extract model info for CSV
+        model_info = {
+            'model_label': f'SAM2-Base+LoRA-subset{subset}',
+            'backbone_ckpt': args.backbone_ckpt,
+            'lora_ckpt': lora_checkpoint,
+            'subset': subset,
+            'rank': 8,
+            'alpha': 16,
+            'lr': 'unknown',
+            'steps': 'unknown',
+            'weight_decay': 'unknown'
+        }
+        
+        # Extract info from LoRA checkpoint path
+        lora_name = os.path.basename(lora_checkpoint)
+        if 'r8' in lora_name or 'r16' in lora_name:
+            if 'r8' in lora_name:
+                model_info['rank'] = 8
+            elif 'r16' in lora_name:
+                model_info['rank'] = 16
+        
+        if 'lr' in lora_name:
+            import re
+            lr_match = re.search(r'lr([0-9e\-\.]+)', lora_name)
+            if lr_match:
+                model_info['lr'] = lr_match.group(1)
+        
+        # Evaluate model
+        print(f"\nEvaluating {model_info['model_label']}...")
+        results, detailed_results = evaluate_lora_sam2(
+            predictor=predictor,
+            test_data=test_data,
+            threshold=args.threshold,
+            save_examples=args.save_examples,
+            output_dir=args.output_dir if args.save_examples else None,
+            evaluation_mode=args.evaluation_mode,
+            num_gt_points=args.num_gt_points,
+            subset=subset
+        )
+        
+        if results is None:
+            print(f"Evaluation failed for subset {subset}!")
+            continue
+        
+        # Print results
+        print(f"\nEvaluation Results for subset {subset}:")
+        print("=" * 50)
+        print(f"Model: {model_info['model_label']}")
+        print(f"Backbone: {os.path.basename(model_info['backbone_ckpt'])}")
+        print(f"LoRA: {os.path.basename(model_info['lora_ckpt'])}")
+        print(f"Evaluation mode: {args.evaluation_mode}")
+        if args.evaluation_mode == "gt_points":
+            print(f"Number of GT points: {args.num_gt_points}")
+        print(f"Basic Metrics (threshold={args.threshold}):")
+        print(f"  mIoU: {results['iou']:.4f}")
+        print(f"  mDice: {results['dice']:.4f}")
+        print(f"  Precision: {results['precision']:.4f}")
+        print(f"  Recall: {results['recall']:.4f}")
+        print(f"  F1: {results['f1']:.4f}")
+        
+        print(f"\nIoU at Different Thresholds:")
+        if 'iou_50' in results:
+            print(f"  IoU@50: {results['iou_50']:.4f}")
+        if 'iou_75' in results:
+            print(f"  IoU@75: {results['iou_75']:.4f}")
+        if 'iou_90' in results:
+            print(f"  IoU@90: {results['iou_90']:.4f}")
+        if 'iou_95' in results:
+            print(f"  IoU@95: {results['iou_95']:.4f}")
+        
+        print(f"\nExtra Metrics:")
+        if 'auprc' in results:
+            print(f"  AUPRC: {results['auprc']:.4f}")
+        
+        print(f"\nPerformance:")
+        if 'avg_inference_time' in results:
+            print(f"  Average inference time: {results['avg_inference_time']:.4f}s")
+        if 'total_inference_time' in results:
+            print(f"  Total inference time: {results['total_inference_time']:.2f}s")
+        
+        # Save results to CSV
+        csv_path = save_results_csv(results, model_info, args.output_dir, 
+                                   args.evaluation_mode, args.num_gt_points)
+        
+        # Save detailed results as JSON
+        json_path = os.path.join(args.output_dir, f"detailed_results_subset_{subset}.json")
+        results_json = {}
+        for key, value in results.items():
+            if isinstance(value, np.ndarray):
+                results_json[key] = value.tolist()
+            else:
+                results_json[key] = value
+        
+        with open(json_path, 'w') as f:
+            json.dump(results_json, f, indent=2)
+        
+        all_results[subset] = {
+            'results': results,
+            'model_info': model_info,
+            'csv_path': csv_path,
+            'json_path': json_path
+        }
+        
+        print(f"\nSubset {subset} evaluation completed!")
+        print(f"Results saved to: {csv_path}")
+        print(f"Detailed results saved to: {json_path}")
+        if args.save_examples:
+            print(f"Prediction examples saved to: {args.output_dir}/subset_{subset}")
     
-    with open(json_path, 'w') as f:
-        json.dump(results_json, f, indent=2)
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"EVALUATION SUMMARY")
+    print(f"{'='*60}")
+    for subset, data in all_results.items():
+        results = data['results']
+        print(f"Subset {subset}: mIoU={results['iou']:.4f}, mDice={results['dice']:.4f}, F1={results['f1']:.4f}")
     
-    print(f"\nEvaluation completed!")
-    print(f"Results saved to: {csv_path}")
-    print(f"Detailed results saved to: {json_path}")
+    print(f"\nAll evaluations completed!")
     if args.save_examples:
-        print(f"Prediction examples saved to: {args.output_dir}")
+        print(f"Prediction examples saved to: {args.output_dir}/subset_*")
 
 if __name__ == "__main__":
     main()

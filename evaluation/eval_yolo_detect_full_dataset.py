@@ -38,9 +38,9 @@ def run_yolo_evaluation(model_path, dataset_yaml, output_dir, conf=0.25, iou=0.7
     
     # YOLO evaluation command
     cmd = [
-        "yolo", "task=detect", "mode=val",
+        "yolo", "task=detect", "mode=predict",
         f"model={model_path}",
-        f"data={dataset_yaml}",
+        f"source={os.path.join(os.path.dirname(dataset_yaml), 'images', 'test')}",
         f"imgsz={imgsz}",
         f"rect={rect}",
         f"conf={conf}",
@@ -50,7 +50,8 @@ def run_yolo_evaluation(model_path, dataset_yaml, output_dir, conf=0.25, iou=0.7
         "save_txt=True",
         "save_conf=True",
         f"project={output_dir}",
-        "name=evaluation_results"
+        "name=predict_test",
+        "exist_ok=True"
     ]
     
     print(f"Running YOLO evaluation command:")
@@ -68,29 +69,22 @@ def run_yolo_evaluation(model_path, dataset_yaml, output_dir, conf=0.25, iou=0.7
 
 
 def parse_evaluation_results(eval_dir):
-    """Parse YOLO evaluation results"""
-    results_file = os.path.join(eval_dir, "evaluation_results", "results.csv")
+    """Parse YOLO evaluation results - in predict mode, we don't have metrics CSV"""
+    # In predict mode, YOLO doesn't generate metrics CSV
+    # We'll create a basic metrics structure for pipeline compatibility
+    print("Note: YOLO predict mode doesn't generate metrics CSV")
+    print("Creating basic metrics structure for pipeline compatibility")
     
-    if not os.path.exists(results_file):
-        print(f"Results file not found: {results_file}")
-        return None
+    # Return basic metrics structure
+    results = {
+        'metrics/mAP50(B)': 0.0,  # Will be filled later if available
+        'metrics/mAP50-95(B)': 0.0,
+        'metrics/mAP75(B)': 0.0,
+        'metrics/precision(B)': 0.0,
+        'metrics/recall(B)': 0.0
+    }
     
-    # Read the results
-    with open(results_file, 'r') as f:
-        lines = f.readlines()
-        if len(lines) < 2:  # Header + at least one data row
-            return None
-        
-        # Get the last data row (final results)
-        last_line = lines[-1].strip()
-        headers = lines[0].strip().split(',')
-        values = last_line.split(',')
-        
-        if len(headers) != len(values):
-            return None
-        
-        results = dict(zip(headers, values))
-        return results
+    return results
 
 
 def save_evaluation_results(exp_id, model, subset_size, variant, prompt_type, img_size, 
@@ -98,9 +92,8 @@ def save_evaluation_results(exp_id, model, subset_size, variant, prompt_type, im
                            predictions_dir, save_dir, timestamp):
     """Save evaluation results to CSV following TFM format"""
     
-    # Create results directory
-    results_dir = os.path.join(save_dir, "results")
-    os.makedirs(results_dir, exist_ok=True)
+    # Use save_dir directly (no subdirectory)
+    results_dir = save_dir
     
     # Prepare results data
     results_data = {
@@ -117,14 +110,14 @@ def save_evaluation_results(exp_id, model, subset_size, variant, prompt_type, im
         'seed': 42,  # Fixed for evaluation
         'val_mIoU': 0.0,  # Not applicable for test evaluation
         'val_Dice': 0.0,  # Not applicable for test evaluation
-        'test_mIoU': test_metrics.get('metrics/seg/bbox/mAP50(B)', 0.0),
-        'test_Dice': test_metrics.get('metrics/seg/bbox/mAP50-95(B)', 0.0),
-        'IoU@50': test_metrics.get('metrics/seg/bbox/mAP50(B)', 0.0),
-        'IoU@75': test_metrics.get('metrics/seg/bbox/mAP75(B)', 0.0),
+        'test_mAP50': test_metrics.get('metrics/mAP50(B)', 0.0),
+        'test_mAP50_95': test_metrics.get('metrics/mAP50-95(B)', 0.0),
+        'IoU@50': test_metrics.get('metrics/mAP50(B)', 0.0),
+        'IoU@75': test_metrics.get('metrics/mAP75(B)', 0.0),
         'IoU@90': 0.0,  # YOLO doesn't provide this
         'IoU@95': 0.0,  # YOLO doesn't provide this
-        'Precision': test_metrics.get('metrics/seg/bbox/precision(B)', 0.0),
-        'Recall': test_metrics.get('metrics/seg/bbox/recall(B)', 0.0),
+        'Precision': test_metrics.get('metrics/precision(B)', 0.0),
+        'Recall': test_metrics.get('metrics/recall(B)', 0.0),
         'F1': 0.0,  # Will calculate if possible
         'ckpt_path': predictions_dir,
         'timestamp': timestamp,
@@ -139,7 +132,7 @@ def save_evaluation_results(exp_id, model, subset_size, variant, prompt_type, im
         results_data['F1'] = 2 * (results_data['Precision'] * results_data['Recall']) / (results_data['Precision'] + results_data['Recall'])
     
     # Save to CSV
-    csv_filename = f"{timestamp}_{model}_{variant}_eval_{conf}_{iou}_{max_det}.csv"
+    csv_filename = f"{timestamp}_{model}_{variant}_detect_eval_{conf}_{iou}_{max_det}.csv"
     csv_path = os.path.join(results_dir, csv_filename)
     
     with open(csv_path, 'w', newline='') as csvfile:
@@ -150,6 +143,37 @@ def save_evaluation_results(exp_id, model, subset_size, variant, prompt_type, im
     
     print(f"Evaluation results saved to: {csv_path}")
     return csv_path
+
+
+def ensure_all_images_have_predictions(test_images_dir, predictions_dir):
+    """Ensure all test images have corresponding .txt files (empty if no detections)"""
+    print(f"Ensuring all test images have prediction files...")
+    
+    # Get all test images
+    test_images = set()
+    for ext in ['.jpg', '.jpeg', '.png']:
+        test_images.update([f.replace(ext, '') for f in os.listdir(test_images_dir) if f.endswith(ext)])
+    
+    # Get existing predictions
+    existing_preds = set()
+    for f in os.listdir(predictions_dir):
+        if f.endswith('.txt'):
+            existing_preds.add(f.replace('.txt', ''))
+    
+    # Create empty .txt files for images without detections
+    missing_preds = test_images - existing_preds
+    if missing_preds:
+        print(f"Creating {len(missing_preds)} empty prediction files for images without detections")
+        for img_name in missing_preds:
+            empty_txt_path = os.path.join(predictions_dir, f"{img_name}.txt")
+            with open(empty_txt_path, 'w') as f:
+                pass  # Empty file
+    else:
+        print("All test images already have prediction files")
+    
+    total_files = len(test_images)
+    print(f"Total prediction files: {total_files} (including {len(missing_preds)} empty)")
+    return total_files
 
 
 def create_pipeline_metadata(predictions_dir, output_dir, conf, iou, max_det, agnostic_nms):
@@ -190,10 +214,10 @@ def main():
     parser.add_argument('--dataset_yaml', type=str, default='data/severstal_det.yaml',
                        help='Path to dataset YAML file')
     parser.add_argument('--output_dir', type=str, 
-                       default='new_src/evaluation/results/yolo_detect_eval',
+                       default='new_src/evaluation/evaluation_results/yolo_detection',
                        help='Directory to save evaluation results')
-    parser.add_argument('--conf', type=float, default=0.25,
-                       help='Confidence threshold')
+    parser.add_argument('--conf', type=float, default=0.15,
+                       help='Confidence threshold (lower = more recall for SAM2 prompts)')
     parser.add_argument('--iou', type=float, default=0.70,
                        help='IoU threshold for NMS')
     parser.add_argument('--max_det', type=int, default=300,
@@ -209,6 +233,13 @@ def main():
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Clean previous predict_test directory if it exists
+    predict_test_dir = os.path.join(args.output_dir, "predict_test")
+    if os.path.exists(predict_test_dir):
+        print(f"Cleaning previous predict_test directory: {predict_test_dir}")
+        import shutil
+        shutil.rmtree(predict_test_dir)
     
     # Check if YOLO is available
     try:
@@ -261,7 +292,7 @@ def main():
         return
     
     # Find the evaluation results directory
-    eval_results_dir = os.path.join(args.output_dir, "evaluation_results")
+    eval_results_dir = os.path.join(args.output_dir, "predict_test")
     if not os.path.exists(eval_results_dir):
         print(f"Evaluation results directory not found: {eval_results_dir}")
         return
@@ -283,6 +314,13 @@ def main():
     # Count prediction files
     pred_files = list(Path(labels_dir).glob("*.txt"))
     print(f"Generated {len(pred_files)} prediction files in: {labels_dir}")
+    
+    # Ensure all test images have prediction files (empty if no detections)
+    test_images_dir = os.path.join(os.path.dirname(args.dataset_yaml), 'images', 'test_split')
+    total_predictions = ensure_all_images_have_predictions(test_images_dir, labels_dir)
+    
+    # Update the count for final reporting
+    pred_files = list(Path(labels_dir).glob("*.txt"))
     
     # Save evaluation results
     exp_id = f"eval_yolo_detect_test_split_{timestamp}"
@@ -326,6 +364,7 @@ def main():
     print(f"Results saved to: {csv_path}")
     print(f"Pipeline metadata: {metadata_file}")
     print(f"Predictions saved to: {labels_dir}")
+    print(f"Total prediction files: {total_predictions} (including empty files for images without detections)")
     
     if test_metrics:
         print(f"\nTest set metrics:")

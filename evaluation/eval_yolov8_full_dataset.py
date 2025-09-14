@@ -223,7 +223,7 @@ def evaluate_yolo_model(model_path, test_data, conf_threshold=0.5, iou_threshold
     print(f"Loading YOLO model: {model_path}")
     
     # Load YOLO model
-    model = YOLO(model_path)
+    model = YOLO(model_path, task="detect")
     
     # First, find optimal confidence threshold for recall >= 0.75
     print("Finding optimal confidence threshold for recall >= 0.75...")
@@ -388,7 +388,7 @@ def create_comparison_plots(results_dict, output_dir="new_src/evaluation/evaluat
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate YOLOv8 Segmentation models on test split")
-    parser.add_argument("--model-dir", type=str, default="runs_tfm",
+    parser.add_argument("--model-dir", type=str, default="new_src/training/training_results/yolo_segmentation",
                        help="Directory containing trained YOLO models")
     parser.add_argument("--test-data", type=str, default="datasets/Data/splits/test_split",
                        help="Path to test data directory")
@@ -396,8 +396,10 @@ def main():
                        help="Confidence threshold for detections")
     parser.add_argument("--iou-threshold", type=float, default=0.5,
                        help="IoU threshold for NMS")
-    parser.add_argument("--output-dir", type=str, default="data/results",
+    parser.add_argument("--output-dir", type=str, default="new_src/evaluation/evaluation_results/yolo_segmentation",
                        help="Output directory for results")
+    parser.add_argument("--lr", type=str, choices=['1e-3', '1e-4', 'both'], default='both',
+                       help="Learning rate to evaluate (1e-3, 1e-4, or both)")
     
     args = parser.parse_args()
     
@@ -440,30 +442,36 @@ def main():
     
     print(f"Prepared {len(test_data)} test samples with annotations")
     
-    # Check if model exists in the specified directory
-    model_path = os.path.join(args.model_dir, "weights", "best.pt")
+    # Find available trained models
+    available_models = {}
     
-    if not os.path.exists(model_path):
-        print(f"Model not found: {model_path}")
-        print("Please ensure the model directory contains 'weights/best.pt'")
-        return
-    
-    # Extract learning rate from directory name
-    dir_name = os.path.basename(args.model_dir)
-    if 'lr1e-3' in dir_name:
-        lr = '1e-3'
-    elif 'lr5e-4' in dir_name:
-        lr = '5e-4'
-    elif 'lr1e-4' in dir_name:
-        lr = '1e-4'
+    if args.lr == 'both':
+        # Look for both lr=1e-3 and lr=1e-4 models
+        for lr in ['1e-3', '1e-4']:
+            model_dir = os.path.join(args.model_dir, f"yolov8s_seg_lr{lr}")
+            model_path = os.path.join(model_dir, "weights", "best.pt")
+            
+            if os.path.exists(model_path):
+                available_models[lr] = model_path
+                print(f"Found model for lr={lr}: {model_path}")
+            else:
+                print(f"Model not found for lr={lr}: {model_path}")
     else:
-        lr = 'unknown'
-    
-    available_models = {lr: model_path}
-    print(f"Found model for lr={lr}: {model_path}")
+        # Look for specific learning rate
+        model_dir = os.path.join(args.model_dir, f"yolov8s_seg_lr{args.lr}")
+        model_path = os.path.join(model_dir, "weights", "best.pt")
+        
+        if os.path.exists(model_path):
+            available_models[args.lr] = model_path
+            print(f"Found model for lr={args.lr}: {model_path}")
+        else:
+            print(f"Model not found for lr={args.lr}: {model_path}")
     
     if not available_models:
         print("No trained models found. Please train models first using train_yolov8_full_dataset.py")
+        print(f"Expected model directories:")
+        print(f"  - {os.path.join(args.model_dir, 'yolov8s_seg_lr1e-3/weights/best.pt')}")
+        print(f"  - {os.path.join(args.model_dir, 'yolov8s_seg_lr1e-4/weights/best.pt')}")
         return
     
     # Evaluate each available model

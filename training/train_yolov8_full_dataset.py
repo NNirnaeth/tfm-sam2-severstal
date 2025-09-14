@@ -237,8 +237,10 @@ def run_yolo_training(lr, project_dir="new_src/training/training_results/yolo_se
         lr_str = "lr1e-3"
     elif lr == 0.0005:
         lr_str = "lr5e-4"
-    else:
+    elif lr == 0.0001:
         lr_str = "lr1e-4"
+    else:
+        lr_str = f"lr{lr}"
     
     # Construct YOLO command
     cmd = [
@@ -283,7 +285,7 @@ def main():
                        help="YOLO model size")
     parser.add_argument("--input-dir", type=str, default="datasets/Data/splits",
                        help="Input directory with .jpg.json annotations")
-            parser.add_argument("--output-dir", type=str, default="/home/ptp/sam2/datasets/yolo_segmentation",
+    parser.add_argument("--output-dir", type=str, default="/home/ptp/sam2/datasets/yolo_segmentation_fixed",
                        help="Output directory for YOLO format dataset")
     parser.add_argument("--skip-conversion", action="store_true",
                        help="Skip annotation conversion (use existing YOLO dataset)")
@@ -329,29 +331,31 @@ def main():
     print(f"\nUsing dataset: {dataset_yaml}")
     
     if args.both:
-        # Train both learning rates
-        print("\n1. Training YOLO-Seg with lr=5e-4")
+        # Train all three learning rates
+        print("\n1. Training YOLO-Seg with lr=1e-3")
+        success_1e3 = run_yolo_training(0.001, args.project, args.model_size, dataset_yaml)
+        
+        print("\n2. Training YOLO-Seg with lr=5e-4")
         success_5e4 = run_yolo_training(0.0005, args.project, args.model_size, dataset_yaml)
         
-        print("\n2. Training YOLO-Seg with lr=1e-4")
+        print("\n3. Training YOLO-Seg with lr=1e-4")
         success_1e4 = run_yolo_training(0.0001, args.project, args.model_size, dataset_yaml)
         
-        if success_5e4 and success_1e4:
-            print("\n✅ Both training runs completed successfully!")
+        if success_1e3 and success_5e4 and success_1e4:
+            print("\n All three training runs completed successfully!")
         else:
-            print("\n❌ Some training runs failed. Check logs above.")
+            print("\n Some training runs failed. Check logs above.")
             
     else:
         # Train single learning rate
         success = run_yolo_training(args.lr, args.project, args.model_size, dataset_yaml)
         if success:
-            print(f"\n✅ Training completed successfully for lr={args.lr}")
+            print(f"\n Training completed successfully for lr={args.lr}")
         else:
-            print(f"\n❌ Training failed for lr={args.lr}")
+            print(f"\n Training failed for lr={args.lr}")
     
     total_time = time.time() - start_time
     print(f"\nTotal execution time: {total_time/3600:.2f} hours")
     print("Training completed!")
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":    main()

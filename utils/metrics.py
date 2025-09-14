@@ -15,8 +15,9 @@ class SegmentationMetrics:
     """Unified metrics calculator for segmentation tasks"""
     
     def __init__(self, save_dir: str = "results"):
-        self.save_dir = save_dir
-        os.makedirs(save_dir, exist_ok=True)
+        # Ensure save_dir is absolute to avoid path resolution issues
+        self.save_dir = os.path.abspath(save_dir)
+        os.makedirs(self.save_dir, exist_ok=True)
         
         # Standard IoU thresholds
         self.iou_thresholds = [0.5, 0.75, 0.9, 0.95]

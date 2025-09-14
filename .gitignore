@@ -1,6 +1,9 @@
 # Heavy result folders to exclude
-training/training_results/
 evaluation/evaluation_results/
+evaluation/debug_results
+training/training_results/
+training/logs
+training/models
 
 # Python cache files
 __pycache__/
