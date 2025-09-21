@@ -32,8 +32,8 @@ This project represents a complete investigation into modern segmentation approa
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                              SUBSET GENERATION                                 │
 │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐     │
-│  │  100    │ │  200    │ │  500    │ │  1000   │ │  2000   │ │  4000   │     │
-│  │ images  │ │ images  │ │ images  │ │ images  │ │ images  │ │ images  │     │
+│  │                     │ │  500    │ │  1000   │ │  2000   │ │  4000   │     │
+│  │                     │ │ images  │ │ images  │ │ images  │ │ images  │     │
 │  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘     │
 └─────────────────────────────────┬─────────────────────────────────────────────┘
                                   │
@@ -491,148 +491,6 @@ python evaluation/eval_all_unet_models.py
 python evaluation/eval_yolo+sam2_full_dataset.py
 ```
 
-##  **COMPREHENSIVE MODEL COMPARISON TABLE (FULL DATASET)**
-
-### ** COMPARATIVE PERFORMANCE OF ALL MODELS ON SEVERSTAL FULL DATASET**
-
-| **Model** | **Architecture** | **Learning Rate** | **mIoU** | **mDice** | **IoU@50** | **IoU@75** | **IoU@90** | **Precision** | **Recall** | **F1** | **AUPRC** | **Inference (s)** |
-|-----------|------------------|-------------------|----------|-----------|-------------|-------------|-------------|---------------|------------|---------|-----------|-------------------|
-| **SAM2-LoRA** | SAM2-Large + LoRA | 1e-3 | **0.505** | **0.642** | **50.5%** | **42.4%** | **28.8%** | **0.730** | **0.648** | **0.642** | **0.779** | **0.214** |
-| **SAM2-Large** | SAM2-Large FT | 1e-5 | 0.544 | 0.649 | 54.5% | 31.0% | 18.9% | 0.886 | 0.607 | 0.649 | N/A | 0.178 |
-| **SAM2-Large-Base** | SAM2-Large (Zero-shot) | N/A | 0.687 | 0.804 | 87.6% | 41.2% | 0.1% | 0.837 | 0.795 | 0.804 | N/A | N/A |
-| **SAM2-Small** | SAM2-Small FT | 1e-5 | 0.323 | 0.471 | 12.5% | 0.1% | 0.0% | 0.912 | 0.338 | 0.471 | N/A | 0.044 |
-| **SAM2-Small-Base** | SAM2-Small (Zero-shot) | N/A | 0.123 | 0.217 | 0.0% | 0.0% | 0.0% | 0.860 | 0.127 | 0.217 | N/A | N/A |
-| **UNet-Std** | UNet Standard | 1e-4 | **0.557** | **0.692** | 55.7% | 55.7% | 55.7% | **0.689** | 0.689 | 0.689 | 0.877 | 0.002 |
-| **UNet-Std** | UNet Standard | 1e-3 | **0.546** | **0.679** | 54.6% | 54.6% | 54.6% | **0.674** | 0.674 | 0.674 | 0.875 | 0.002 |
-| **DSC-UNet** | DSC-UNet | 1e-4 | 0.559 | 0.692 | 55.9% | 50.3% | 44.7% | 0.696 | 0.778 | 0.692 | 0.725 | 0.005 |
-| **DSC-UNet** | DSC-UNet | 1e-3 | **0.534** | **0.667** | 53.4% | 53.4% | 53.4% | 0.667 | 0.667 | 0.667 | N/A | N/A |
-| **UNet++** | UNet++ | 1e-4 | 0.544 | 0.679 | 54.4% | 48.9% | 43.5% | 0.667 | 0.790 | 0.679 | 0.811 | 0.006 |
-| **UNet++** | UNet++ | 1e-3 | **0.524** | **0.648** | 52.4% | 52.4% | 52.4% | 0.648 | 0.648 | 0.648 | N/A | N/A |
-| **YOLOv8-Seg** | YOLOv8-Seg | 5e-4 | 0.473 | 0.615 | 49.4% | 49.7% | 50.0% | 0.599 | 0.724 | 0.615 | N/A | N/A |
-| **YOLOv8-Seg** | YOLOv8-Seg | 1e-4 | **0.480** | **0.624** | 48.0% | 48.0% | 48.0% | **0.622** | 0.622 | 0.622 | N/A | N/A |
-| **YOLOv8-Seg** | YOLOv8-Seg | 1e-3 | **0.458** | **0.599** | 45.8% | 45.8% | 45.8% | 0.599 | 0.599 | 0.599 | N/A | N/A |
-
-**Legend**: FT = Fine-tuned, LoRA = Low-Rank Adaptation, Base = No fine-tuning (zero-shot)
-
----
-
-##  **DETAILED RESULTS INTERPRETATION**
-
-### ** TOP PERFORMERS ANALYSIS**
-
-#### **1. SAM2-LoRA (1st Place - mIoU: 0.505, mDice: 0.642)**
-- **Key Strength**: Best overall performance with parameter-efficient training
-- **LoRA Advantage**: 99% parameter reduction while maintaining competitive quality
-- **Balanced Metrics**: Strong precision (0.730) and recall (0.648) balance
-- **Threshold Performance**: Excellent IoU@50 (50.5%), good IoU@75 (42.4%)
-- **Inference Speed**: Moderate (0.214s) - good for production use
-
-#### **2. SAM2-Large Fine-tuned (2nd Place - mIoU: 0.544, mDice: 0.649)**
-- **Key Strength**: Highest mIoU among fine-tuned models
-- **Full Fine-tuning**: All parameters updated for maximum adaptation
-- **Precision Leader**: Outstanding precision (0.886) - minimal false positives
-- **Threshold Performance**: Strong IoU@50 (54.5%), moderate IoU@75 (31.0%)
-- **Trade-off**: Higher performance but requires more computational resources
-
-#### **3. SAM2-Large Base (3rd Place - mIoU: 0.687, mDice: 0.804)**
-- **Key Strength**: Remarkable zero-shot performance without any training
-- **Foundation Model Power**: Demonstrates SAM2's pre-trained capabilities
-- **Threshold Performance**: Exceptional IoU@50 (87.6%), good IoU@75 (41.2%)
-- **Limitation**: Poor IoU@90+ performance (0.1%) - lacks fine-tuning precision
-
-### ** ARCHITECTURE COMPARISON**
-
-#### **UNet Variants Performance Hierarchy**
-1. **DSC-UNet** (mIoU: 0.559) - Deep supervision provides best performance
-2. **UNet++** (mIoU: 0.544) - Nested skip connections improve feature fusion
-3. **UNet Standard** (mIoU: 0.078-0.084) - Basic architecture struggles with steel defects
-
-**Key Insight**: Architectural improvements (DSC, UNet++) provide significant performance gains over standard UNet, but still fall short of foundation models.
-
-#### **YOLO Segmentation Performance**
-- **Best Configuration**: LR=5e-4 (mIoU: 0.473, mDice: 0.615)
-- **Learning Rate Sensitivity**: Performance varies dramatically with learning rate
-- **Threshold Performance**: Consistent IoU@50-90 performance (49-50%)
-- **Limitation**: Lower overall performance compared to SAM2 models
-
-### ** LEARNING RATE IMPACT ANALYSIS**
-
-#### **UNet Models**
-- **LR 1e-4 vs 1e-3**: Higher learning rate (1e-3) slightly degrades performance
-- **Optimal Range**: 1e-4 provides best balance for UNet architectures
-- **Stability**: Lower learning rates ensure more stable training
-
-#### **YOLO Models**
-- **LR 5e-4**: Optimal performance (mIoU: 0.473)
-- **LR 1e-3**: Moderate performance (mIoU: 0.032)
-- **LR 1e-4**: Poor performance (mIoU: 0.005)
-- **Key Finding**: YOLO is highly sensitive to learning rate selection
-
-### ** KEY INSIGHTS FOR TFM**
-
-#### **1. Foundation Model Superiority**
-- **SAM2 models** consistently outperform traditional CNNs (UNet, YOLO)
-- **Zero-shot performance** of SAM2-Large (mIoU: 0.687) exceeds all fine-tuned UNet variants
-- **Foundation models** provide strong baseline even without domain-specific training
-
-#### **2. LoRA Efficiency**
-- **Parameter efficiency**: 99% reduction with minimal performance loss
-- **Competitive quality**: LoRA achieves 2nd best overall performance
-- **Production ready**: Good balance of performance and resource efficiency
-
-#### **3. Data Efficiency**
-- **SAM2-Large fine-tuned**: Best performance with full dataset training
-- **LoRA adaptation**: Strong performance with efficient training
-- **Zero-shot capability**: SAM2 provides immediate usable performance
-
-#### **4. Architecture Trade-offs**
-- **UNet variants**: Good for resource-constrained environments
-- **YOLO segmentation**: Fast but lower accuracy
-- **SAM2**: Best performance but higher computational requirements
-
-#### **5. Learning Rate Sensitivity**
-- **UNet**: Stable performance across learning rates (1e-4 optimal)
-- **YOLO**: Highly sensitive to learning rate selection
-- **SAM2**: Robust performance with various fine-tuning approaches
-
-### ** RECOMMENDATIONS FOR PRODUCTION**
-
-#### **High-Performance Applications**
-- **Primary Choice**: SAM2-LoRA (best performance/efficiency balance)
-- **Alternative**: SAM2-Large fine-tuned (maximum performance)
-
-#### **Resource-Constrained Environments**
-- **Primary Choice**: DSC-UNet (best traditional CNN performance)
-- **Alternative**: UNet++ (good performance with moderate resources)
-
-#### **Real-Time Applications**
-- **Primary Choice**: YOLOv8-Seg with LR=5e-4
-- **Alternative**: SAM2-Small variants for speed/accuracy balance
-
-#### **Zero-Deployment Applications**
-- **Primary Choice**: SAM2-Large base (immediate usable performance)
-- **Use Case**: Quick prototyping, emergency deployments, baseline establishment
-
-This comprehensive analysis demonstrates that **SAM2 models consistently outperform traditional architectures** across all metrics, with **LoRA providing the best performance/efficiency balance** for production deployment in steel defect detection applications.
-
-##  Key Findings and Insights
-
-### **Performance Rankings**
-1. **SAM2 LoRA Large**: Best overall (mIoU=0.505, mDice=0.642)
-2. **SAM2 Large Subsets**: Strong few-shot performance
-3. **UNet Variants**: Reliable baseline performance
-4. **YOLO Pipeline**: Real-time capable alternative
-
-### **Data Efficiency**
-- **4000 images**: Achieve 85% of full dataset performance
-- **LoRA advantage**: Minimal parameter overhead with competitive results
-- **Subset scaling**: Clear performance correlation with data size
-
-### **Architecture Insights**
-- **SAM2 superiority**: Foundation model adaptation outperforms traditional CNNs
-- **LoRA efficiency**: Parameter-efficient fine-tuning maintains quality
-- **Pipeline benefits**: YOLO + SAM2 combines speed and precision
-
 ##  Technical Requirements
 
 ### **Dependencies**
@@ -652,6 +510,6 @@ pip install -r requirements_unet.txt
 
 ##  License and Citation
 
-This project is part of a Master's thesis on steel defect detection using SAM2. The implementation provides a comprehensive benchmark for modern segmentation approaches in industrial quality control applications.
+This project is part of a Master's thesis on steel defect detection using different models. The implementation provides a comprehensive benchmark for modern segmentation approaches in industrial quality control applications.
 
 
